@@ -15,7 +15,8 @@ class TallyService:
         headers = {'Content-Type': 'text/xml'}
         try:
             # Increased timeout to 60 seconds because Tally reports can take time to generate
-            response = requests.post(self.url, data=xml_payload, headers=headers, timeout=60)
+            # Explicitly disable proxies to prevent HTTP_PROXY environment variables from hijacking the request
+            response = requests.post(self.url, data=xml_payload, headers=headers, timeout=60, proxies={"http": None, "https": None})
             response.raise_for_status()
             return response.text
         except requests.exceptions.RequestException as e:
@@ -58,20 +59,30 @@ class TallyService:
             data = []
             entity_name = None
             
-            # Find the COLLECTION node
-            collection_node = None
+            # Find the COLLECTION node or fallback to ENVELOPE's direct children
+            target_node = None
             for elem in root.iter('COLLECTION'):
-                collection_node = elem
+                target_node = elem
                 break
                 
-            if collection_node is None:
-                logger.warning("No COLLECTION node found in XML.")
+            if target_node is None and root.tag == 'ENVELOPE':
+                # Check if ENVELOPE has data children (e.g., custom TDL responses)
+                for child in root:
+                    if child.tag not in ('HEADER', 'BODY'):
+                        target_node = root
+                        break
+                        
+            if target_node is None:
+                logger.warning("No COLLECTION node or data records found in XML.")
                 return data, entity_name
                 
-            # Determine the entity type from the first child of COLLECTION
-            if len(collection_node) > 0:
-                entity_name = collection_node[0].tag
-            else:
+            # Determine the entity type from the first data child of target_node
+            for child in target_node:
+                if child.tag not in ('HEADER', 'BODY'):
+                    entity_name = child.tag
+                    break
+                    
+            if not entity_name:
                 return data, entity_name
                 
             def element_to_dict(elem):
@@ -93,7 +104,7 @@ class TallyService:
                             result[child.tag] = child_dict
                 return result
 
-            for item in collection_node.iter(entity_name):
+            for item in target_node.iter(entity_name):
                 item_data = {}
                 
                 # Extract attributes of the item itself (like ALTERID)

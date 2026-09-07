@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 
 from database.config import Base, LocalBase, get_local_db, sqlite_engine
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 import urllib.parse
 from models import SyncConfig, SyncLog, MysqlConfig
@@ -24,7 +24,11 @@ logger = logging.getLogger(__name__)
 # Create local tables
 LocalBase.metadata.create_all(bind=sqlite_engine)
 
+_mysql_engine = None
+_mysql_db_url = None
+
 def get_mysql_engine(local_db: Session):
+    global _mysql_engine, _mysql_db_url
     mysql_config = local_db.query(MysqlConfig).first()
     if not mysql_config:
         raise Exception("MySQL Configuration not found.")
@@ -32,7 +36,21 @@ def get_mysql_engine(local_db: Session):
     encoded_password = urllib.parse.quote_plus(mysql_config.password or "")
     db_url = f"mysql+pymysql://{mysql_config.username}:{encoded_password}@{mysql_config.host}:{mysql_config.port}/{mysql_config.database_name}"
     
-    return create_engine(db_url, pool_pre_ping=True)
+    # Return cached engine if the URL hasn't changed
+    if _mysql_engine is not None and _mysql_db_url == db_url:
+        return _mysql_engine
+        
+    # If it changed or doesn't exist, create a new one
+    if _mysql_engine is not None:
+        _mysql_engine.dispose()
+        
+    _mysql_engine = create_engine(db_url, pool_pre_ping=True, pool_size=10, max_overflow=20)
+    _mysql_db_url = db_url
+    
+    # Automatically create missing tables (like sync_config, sync_logs)
+    Base.metadata.create_all(bind=_mysql_engine)
+    
+    return _mysql_engine
 
 def get_db(local_db: Session = Depends(get_local_db)):
     try:
@@ -100,6 +118,24 @@ class MysqlConfigSchema(BaseModel):
     database_name: str
 
 from typing import List
+
+@app.get("/api/debug/tables")
+def get_tables(db: Session = Depends(get_db)):
+    """Debug endpoint to list all tables in MySQL."""
+    from sqlalchemy import inspect
+    engine = db.get_bind()
+    
+    # Drop sync_logs to recreate it with LONGTEXT
+    with engine.connect() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS sync_logs"))
+        conn.commit()
+    Base.metadata.create_all(bind=engine)
+    
+    inspector = inspect(engine)
+    schema = {}
+    for table in inspector.get_table_names():
+        schema[table] = [{"name": c["name"], "type": str(c["type"])} for c in inspector.get_columns(table)]
+    return {"tables": inspector.get_table_names(), "schema": schema, "url": str(engine.url).replace(engine.url.password, '***') if engine.url.password else str(engine.url)}
 
 @app.get("/api/config", response_model=List[ConfigSchema])
 def get_config(db: Session = Depends(get_db)):
@@ -220,7 +256,7 @@ def test_sync(test_data: Optional[TestConfigSchema] = None, db: Session = Depend
             )
             db.add(log_entry)
             db.commit()
-                
+            
             return {"status": "SUCCESS", "message": msg, "response_xml": response_text}
         else:
             # Default check connection
@@ -267,6 +303,12 @@ def save_mysql_config_api(config_data: MysqlConfigSchema, db: Session = Depends(
     
     # Try to connect and create the internal tables in the new MySQL database
     try:
+        encoded_password = urllib.parse.quote_plus(config_data.password or "")
+        server_url = f"mysql+pymysql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/"
+        server_engine = sa_create_engine(server_url)
+        with server_engine.connect() as conn:
+            conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{config_data.database_name}`"))
+            
         engine = get_mysql_engine(db)
         Base.metadata.create_all(bind=engine)
     except Exception as e:
@@ -280,12 +322,19 @@ def validate_mysql_config(config_data: MysqlConfigSchema):
     try:
         # URL encode password in case it has special chars like @
         encoded_password = urllib.parse.quote_plus(config_data.password or "")
-        test_url = f"mysql+pymysql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/{config_data.database_name}"
         
+        # Connect to MySQL server WITHOUT specifying database name first to create it if missing
+        server_url = f"mysql+pymysql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/"
+        server_engine = sa_create_engine(server_url)
+        with server_engine.connect() as conn:
+            conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{config_data.database_name}`"))
+
+        # Now test connection to the specific database
+        test_url = f"mysql+pymysql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/{config_data.database_name}"
         test_engine = sa_create_engine(test_url)
         with test_engine.connect() as conn:
             pass # successful connection
-        return {"status": "SUCCESS", "message": "MySQL Connection Successful"}
+        return {"status": "SUCCESS", "message": "MySQL Connection Successful & DB Ready"}
     except OperationalError as e:
         raise HTTPException(status_code=400, detail=f"Connection failed: {str(e.orig)}")
     except Exception as e:
