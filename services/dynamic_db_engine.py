@@ -129,6 +129,12 @@ class DynamicDbEngine:
             
             # Programmatic UPSERT fallback because we don't dynamically create UNIQUE constraints yet
             logger.info("Performing programmatic Upsert")
+            
+            # If no unique key is available, we should clear the table to prevent duplicates (Full Refresh)
+            if not unique_key:
+                logger.info(f"No unique key found. Clearing table {dynamic_table.name} before insert to prevent duplicates.")
+                conn.execute(dynamic_table.delete())
+                
             for row in clean_data:
                 if unique_key:
                     safe_unique_key = ''.join(c for c in unique_key if c.isalnum() or c == '_')
@@ -149,7 +155,7 @@ class DynamicDbEngine:
                     else:
                         conn.execute(dynamic_table.insert().values(**row))
                 else:
-                    # No unique key, just insert
+                    # No unique key, just insert (table was already cleared above)
                     conn.execute(dynamic_table.insert().values(**row))
                     
             conn.commit()

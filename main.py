@@ -1,6 +1,6 @@
 import logging
 import uvicorn
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -251,8 +251,8 @@ def test_sync(test_data: Optional[TestConfigSchema] = None, db: Session = Depend
                 status="SUCCESS", 
                 message=msg, 
                 records_fetched=records_count,
-                request_payload=test_data.request_xml if test_data else None,
-                response_payload=response_text
+                request_payload=test_data.request_xml[:50000] if test_data and test_data.request_xml else None,
+                response_payload=response_text[:50000] if response_text else None
             )
             db.add(log_entry)
             db.commit()
@@ -269,12 +269,70 @@ def test_sync(test_data: Optional[TestConfigSchema] = None, db: Session = Depend
             status="ERROR", 
             message=str(e), 
             records_fetched=0,
-            request_payload=request_payload,
+            request_payload=request_payload[:50000] if request_payload else None,
             response_payload=None
         )
         db.add(log_entry)
         db.commit()
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/sync/start")
+def start_sync(background_tasks: BackgroundTasks, test_data: Optional[TestConfigSchema] = None, db: Session = Depends(get_db)):
+    """Starts a sync in the background and returns a log_id."""
+    if test_data and test_data.tally_host and test_data.tally_port:
+        host = test_data.tally_host
+        port = test_data.tally_port
+        connection_name = test_data.connection_name
+    else:
+        config = db.query(SyncConfig).first()
+        if not config:
+            raise HTTPException(status_code=400, detail="Configuration not set")
+        host = config.tally_host
+        port = config.tally_port
+        connection_name = config.connection_name
+
+    # Create the initial log entry
+    log_entry = SyncLog(
+        connection_name=connection_name,
+        status="IN_PROGRESS",
+        message="Sync started in background.",
+        records_fetched=0
+    )
+    db.add(log_entry)
+    db.commit()
+    db.refresh(log_entry)
+    log_id = log_entry.id
+
+    # Fire background task
+    def background_sync_task(log_id, host, port, connection_name):
+        # We need a new DB session for the background task
+        engine = get_mysql_engine(next(get_local_db()))
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        bg_db = SessionLocal()
+        try:
+            service = SyncService(bg_db, host, port)
+            service.run_sync(connection_name=connection_name, log_id=log_id)
+        finally:
+            bg_db.close()
+
+    background_tasks.add_task(background_sync_task, log_id, host, port, connection_name)
+    
+    return {"status": "SUCCESS", "message": "Sync started.", "log_id": log_id}
+
+@app.get("/api/sync/progress/{log_id}")
+def sync_progress(log_id: int, db: Session = Depends(get_db)):
+    """Poll for the current progress of a sync."""
+    log_entry = db.query(SyncLog).filter(SyncLog.id == log_id).first()
+    if not log_entry:
+        raise HTTPException(status_code=404, detail="Log entry not found")
+        
+    return {
+        "log_id": log_entry.id,
+        "status": log_entry.status,
+        "records_fetched": log_entry.records_fetched,
+        "message": log_entry.message,
+        "response_payload": log_entry.response_payload
+    }
 
 import urllib.parse
 from sqlalchemy import create_engine as sa_create_engine
