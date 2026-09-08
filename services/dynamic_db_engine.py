@@ -1,7 +1,7 @@
 import hashlib
 import logging
 from typing import List, Dict, Tuple
-from sqlalchemy import Table, Column, Integer, String, Text, MetaData, select, inspect, func, text
+from sqlalchemy import Table, Column, Integer, String, Text, MetaData, select, inspect, func, text, Float, BigInteger, Date
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.mysql import insert
 import datetime
@@ -11,6 +11,56 @@ from sqlalchemy import create_engine
 from models import TallyTableMetadata
 
 logger = logging.getLogger(__name__)
+
+def detect_column_type(values: List[str]):
+    """Global function to detect SQL data type based on sample values."""
+    if not values:
+        return Text
+
+    valid_values = [str(v).strip() for v in values if v is not None and str(v).strip() != ""]
+    if not valid_values:
+        return Text
+
+    is_int = True
+    is_float = True
+    is_date = True
+
+    for val in valid_values:
+        val_str = str(val).strip()
+        clean_val_str = val_str.replace("(-)", "-")
+        
+        if is_int:
+            try:
+                int(clean_val_str)
+            except ValueError:
+                is_int = False
+                
+        if is_float:
+            try:
+                float(clean_val_str)
+            except ValueError:
+                is_float = False
+                
+        if is_date:
+            if len(val_str) == 8 and val_str.isdigit():
+                try:
+                    datetime.datetime.strptime(val_str, "%Y%m%d")
+                except ValueError:
+                    is_date = False
+            else:
+                is_date = False
+                
+        if not is_int and not is_float and not is_date:
+            return Text
+
+    if is_int:
+        return BigInteger
+    if is_float:
+        return Float
+    if is_date:
+        return Date
+
+    return Text
 
 class DynamicDbEngine:
     def __init__(self, db_session: Session):
@@ -24,7 +74,10 @@ class DynamicDbEngine:
         hash_input = "|".join(sorted_cols).encode('utf-8')
         return hashlib.sha256(hash_input).hexdigest()
         
-    def _get_or_create_table(self, report_name: str, entity_name: str, columns: List[str]) -> Table:
+    def _get_or_create_table(self, report_name: str, entity_name: str, columns: List[str], column_types: Dict[str, type] = None) -> Table:
+        if column_types is None:
+            column_types = {}
+            
         structure_hash = self._generate_structure_hash(columns)
         
         safe_entity = ''.join(c for c in entity_name.lower() if c.isalnum() or c == '_')
@@ -40,7 +93,16 @@ class DynamicDbEngine:
                     safe_col_name = ''.join(c for c in col_name if c.isalnum() or c == '_')
                     if safe_col_name not in existing_columns:
                         logger.info(f"Adding new column {safe_col_name} to {table_name}")
-                        conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {safe_col_name} LONGTEXT"))
+                        col_type = column_types.get(col_name, Text)
+                        if col_type == BigInteger:
+                            sql_type = "BIGINT"
+                        elif col_type == Float:
+                            sql_type = "FLOAT"
+                        elif col_type == Date:
+                            sql_type = "DATE"
+                        else:
+                            sql_type = "LONGTEXT"
+                        conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {safe_col_name} {sql_type}"))
             
             # Update metadata
             meta_entry = self.db.query(TallyTableMetadata).filter_by(table_name=table_name).first()
@@ -58,7 +120,7 @@ class DynamicDbEngine:
         db_columns = [Column("id", Integer, primary_key=True, autoincrement=True)]
         for col_name in columns:
             safe_col_name = ''.join(c for c in col_name if c.isalnum() or c == '_')
-            db_columns.append(Column(safe_col_name, Text))
+            db_columns.append(Column(safe_col_name, column_types.get(col_name, Text)))
             
         dynamic_table = Table(table_name, self.metadata, *db_columns)
         self.metadata.create_all(self.engine)
@@ -94,8 +156,18 @@ class DynamicDbEngine:
             all_columns_set.update(item.keys())
         all_columns = list(all_columns_set)
         
+        column_samples = {k: [] for k in all_columns}
+        for item in data:
+            for k, v in item.items():
+                if len(column_samples[k]) < 500:
+                    column_samples[k].append(v)
+                    
+        column_types = {}
+        for k, v in column_samples.items():
+            column_types[k] = detect_column_type(v)
+        
         # Get or create table
-        dynamic_table = self._get_or_create_table(report_name, entity_name, all_columns)
+        dynamic_table = self._get_or_create_table(report_name, entity_name, all_columns, column_types)
         
         unique_key = self._determine_unique_key(all_columns)
         
@@ -106,6 +178,29 @@ class DynamicDbEngine:
                 clean_item = {}
                 for k, v in item.items():
                     safe_k = ''.join(c for c in k if c.isalnum() or c == '_')
+                    
+                    if v is not None:
+                        col_type = column_types.get(k)
+                        if col_type == Date:
+                            v_str = str(v).strip()
+                            if len(v_str) == 8 and v_str.isdigit():
+                                try:
+                                    v = datetime.datetime.strptime(v_str, "%Y%m%d").date()
+                                except ValueError:
+                                    pass
+                        elif col_type == Float:
+                            v_str = str(v).strip().replace("(-)", "-")
+                            try:
+                                v = float(v_str)
+                            except ValueError:
+                                pass
+                        elif col_type == BigInteger:
+                            v_str = str(v).strip().replace("(-)", "-")
+                            try:
+                                v = int(v_str)
+                            except ValueError:
+                                pass
+                                
                     clean_item[safe_k] = v
                 clean_data.append(clean_item)
 
