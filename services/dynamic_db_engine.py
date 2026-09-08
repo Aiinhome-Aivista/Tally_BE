@@ -127,36 +127,45 @@ class DynamicDbEngine:
                     # standard UPSERT might fail if there's no unique index. 
                     # Let's do a programmatic upsert for safety.
             
-            # Programmatic UPSERT fallback because we don't dynamically create UNIQUE constraints yet
-            logger.info("Performing programmatic Upsert")
+            # Programmatic UPSERT fallback optimized for batching
+            logger.info("Performing optimized programmatic Upsert")
             
-            # If no unique key is available, we should clear the table to prevent duplicates (Full Refresh)
             if not unique_key:
                 logger.info(f"No unique key found. Clearing table {dynamic_table.name} before insert to prevent duplicates.")
                 conn.execute(dynamic_table.delete())
+                if clean_data:
+                    conn.execute(dynamic_table.insert(), clean_data)
+            else:
+                safe_unique_key = ''.join(c for c in unique_key if c.isalnum() or c == '_')
                 
-            for row in clean_data:
-                if unique_key:
-                    safe_unique_key = ''.join(c for c in unique_key if c.isalnum() or c == '_')
+                # Extract all unique values in this batch
+                batch_unique_vals = [row[safe_unique_key] for row in clean_data if row.get(safe_unique_key)]
+                
+                # Fetch existing ones in ONE query
+                existing_vals = set()
+                if batch_unique_vals:
+                    sel = select(getattr(dynamic_table.c, safe_unique_key)).where(getattr(dynamic_table.c, safe_unique_key).in_(batch_unique_vals))
+                    result = conn.execute(sel).fetchall()
+                    existing_vals = {r[0] for r in result}
+                
+                to_insert = []
+                to_update = []
+                
+                for row in clean_data:
                     unique_val = row.get(safe_unique_key)
-                    
-                    if unique_val:
-                        # Check if exists
-                        sel = select(dynamic_table).where(getattr(dynamic_table.c, safe_unique_key) == unique_val)
-                        result = conn.execute(sel).first()
-                        
-                        if result:
-                            # Update
-                            upd = dynamic_table.update().where(getattr(dynamic_table.c, safe_unique_key) == unique_val).values(**row)
-                            conn.execute(upd)
-                        else:
-                            # Insert
-                            conn.execute(dynamic_table.insert().values(**row))
+                    if unique_val and unique_val in existing_vals:
+                        to_update.append((unique_val, row))
                     else:
-                        conn.execute(dynamic_table.insert().values(**row))
-                else:
-                    # No unique key, just insert (table was already cleared above)
-                    conn.execute(dynamic_table.insert().values(**row))
+                        to_insert.append(row)
+                
+                # Bulk insert new rows
+                if to_insert:
+                    conn.execute(dynamic_table.insert(), to_insert)
+                    
+                # Sequentially update existing rows (still faster since no SELECT per row)
+                for unique_val, row in to_update:
+                    upd = dynamic_table.update().where(getattr(dynamic_table.c, safe_unique_key) == unique_val).values(**row)
+                    conn.execute(upd)
                     
             conn.commit()
-            logger.info(f"Successfully synced {len(data)} records to {dynamic_table.name}")
+            logger.info(f"Successfully synced {len(clean_data)} records to {dynamic_table.name}")
