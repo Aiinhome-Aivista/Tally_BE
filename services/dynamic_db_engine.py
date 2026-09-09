@@ -139,7 +139,7 @@ class DynamicDbEngine:
 
     def _determine_unique_key(self, columns: List[str]) -> str:
         """Find the best unique key available in the dataset."""
-        candidates = ['GUID', 'ALTERID', 'VOUCHERNUMBER', 'NAME']
+        candidates = ['VOUCHERMASTERID', 'GUID', 'ALTERID', 'VOUCHERNUMBER', 'NAME']
         for cand in candidates:
             if cand in columns:
                 return cand
@@ -236,31 +236,13 @@ class DynamicDbEngine:
                 # Extract all unique values in this batch
                 batch_unique_vals = [row[safe_unique_key] for row in clean_data if row.get(safe_unique_key)]
                 
-                # Fetch existing ones in ONE query
-                existing_vals = set()
                 if batch_unique_vals:
-                    sel = select(getattr(dynamic_table.c, safe_unique_key)).where(getattr(dynamic_table.c, safe_unique_key).in_(batch_unique_vals))
-                    result = conn.execute(sel).fetchall()
-                    existing_vals = {r[0] for r in result}
+                    # Delete existing records that match the unique keys in this batch
+                    conn.execute(dynamic_table.delete().where(getattr(dynamic_table.c, safe_unique_key).in_(batch_unique_vals)))
                 
-                to_insert = []
-                to_update = []
-                
-                for row in clean_data:
-                    unique_val = row.get(safe_unique_key)
-                    if unique_val and unique_val in existing_vals:
-                        to_update.append((unique_val, row))
-                    else:
-                        to_insert.append(row)
-                
-                # Bulk insert new rows
-                if to_insert:
-                    conn.execute(dynamic_table.insert(), to_insert)
-                    
-                # Sequentially update existing rows (still faster since no SELECT per row)
-                for unique_val, row in to_update:
-                    upd = dynamic_table.update().where(getattr(dynamic_table.c, safe_unique_key) == unique_val).values(**row)
-                    conn.execute(upd)
+                # Bulk insert all rows from the batch
+                if clean_data:
+                    conn.execute(dynamic_table.insert(), clean_data)
                     
             conn.commit()
             logger.info(f"Successfully synced {len(clean_data)} records to {dynamic_table.name}")

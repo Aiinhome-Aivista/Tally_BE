@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Text
+from sqlalchemy import Column, Integer, String, DateTime, Text, JSON
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.sql import func
 from database.config import Base, LocalBase
@@ -18,6 +18,7 @@ class SyncConfig(Base):
     last_sync_time = Column(DateTime(timezone=True), default=None)
     status = Column(String(50), default="IDLE") # IDLE, SYNCING, ERROR
     last_alter_id = Column(Integer, default=0)
+    parameters = Column(JSON, nullable=True)
 
 class SyncLog(Base):
     __tablename__ = "sync_logs"

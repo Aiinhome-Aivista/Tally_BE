@@ -12,7 +12,7 @@ class SyncService:
         self.tally_service = TallyService(host, port)
         self.db_engine = DynamicDbEngine(db)
 
-    def run_sync(self, connection_name=None, log_id=None):
+    def run_sync(self, connection_name=None, log_id=None, parameters=None):
         request_payload = None
         
         # If log_id is not provided (e.g., from scheduler), create one
@@ -57,6 +57,25 @@ class SyncService:
             if "{LAST_ALTER_ID}" in request_payload:
                 request_payload = request_payload.replace("{LAST_ALTER_ID}", str(last_alter_id))
                 logger.info(f"Replaced {{LAST_ALTER_ID}} with {last_alter_id}")
+                
+            dynamic_params = parameters if parameters is not None else (config.parameters or {})
+            if dynamic_params:
+                for k, v in dynamic_params.items():
+                    placeholder = f"{{{k}}}"
+                    if placeholder in request_payload:
+                        request_payload = request_payload.replace(placeholder, str(v))
+                        logger.info(f"Replaced {placeholder} with {v}")
+                    else:
+                        # Auto-inject into STATICVARIABLES if placeholder is missing from XML
+                        if "</STATICVARIABLES>" in request_payload.upper():
+                            import re
+                            injection = f"\n                <{k}>{v}</{k}>\n            </STATICVARIABLES>"
+                            request_payload = re.sub(r'</STATICVARIABLES>', injection, request_payload, flags=re.IGNORECASE)
+                            logger.info(f"Auto-injected <{k}>{v}</{k}> into STATICVARIABLES")
+                        
+            # Remove any remaining {KEY} placeholders that were not provided in parameters
+            import re
+            request_payload = re.sub(r'\{[A-Za-z0-9_]+\}', '', request_payload)
             
             # Use streaming request
             response_stream = self.tally_service._send_request_stream(request_payload)

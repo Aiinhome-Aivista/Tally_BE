@@ -64,24 +64,46 @@ class TallyService:
                     buffer += chunk
                     # To prevent splitting an XML entity like &#x1F; across chunks,
                     # we check if there's an '&' near the end of the buffer.
-                    last_amp = buffer.rfind('&')
-                    if last_amp != -1 and len(buffer) - last_amp < 10:
-                        to_process = buffer[:last_amp]
-                        buffer = buffer[last_amp:]
+                    last_open = buffer.rfind('<')
+                    last_close = buffer.rfind('>')
+                    if last_open != -1 and last_open > last_close:
+                        # Prevent splitting an XML tag across chunks
+                        to_process = buffer[:last_open]
+                        buffer = buffer[last_open:]
                     else:
-                        to_process = buffer
-                        buffer = ""
+                        # Prevent splitting an XML entity like &#x1F; across chunks
+                        last_amp = buffer.rfind('&')
+                        if last_amp != -1 and len(buffer) - last_amp < 10:
+                            to_process = buffer[:last_amp]
+                            buffer = buffer[last_amp:]
+                        else:
+                            to_process = buffer
+                            buffer = ""
                         
                     if to_process:
                         # Clean raw invalid characters
                         clean_chunk = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f]', '', to_process)
                         # Clean invalid entities dynamically
                         clean_chunk = re.sub(r'&#[xX]?[0-9a-fA-F]+;', valid_xml_char, clean_chunk)
+                        # Escape unescaped ampersands that break XML parsing
+                        clean_chunk = re.sub(r'&(?!(?:apos|quot|[lg]t|amp);|#)', '&amp;', clean_chunk)
+                        
+                        # Fix Tally's invalid tags like <#VCHUDF...>
+                        def fix_tag(m):
+                            return m.group(0).replace('#', '_').replace(':', '_')
+                        clean_chunk = re.sub(r'</?#[^>]+>', fix_tag, clean_chunk)
+                        
                         yield clean_chunk.encode('utf-8')
                         
             if buffer:
                 clean_chunk = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f]', '', buffer)
                 clean_chunk = re.sub(r'&#[xX]?[0-9a-fA-F]+;', valid_xml_char, clean_chunk)
+                clean_chunk = re.sub(r'&(?!(?:apos|quot|[lg]t|amp);|#)', '&amp;', clean_chunk)
+                
+                def fix_tag(m):
+                    return m.group(0).replace('#', '_').replace(':', '_')
+                clean_chunk = re.sub(r'</?#[^>]+>', fix_tag, clean_chunk)
+                
                 yield clean_chunk.encode('utf-8')
 
         def element_to_dict(elem):
@@ -231,6 +253,13 @@ class TallyService:
             clean_xml = re.sub(r'&#x([0-8BCEF]|1[0-9A-F]);', '', clean_xml, flags=re.IGNORECASE)
             # Remove invalid decimal entities (e.g., &#28;)
             clean_xml = re.sub(r'&#([0-8]|1[12]|1[4-9]|2[0-9]|3[01]);', '', clean_xml)
+            # Escape unescaped ampersands
+            clean_xml = re.sub(r'&(?!(?:apos|quot|[lg]t|amp);|#)', '&amp;', clean_xml)
+            
+            # Fix Tally's invalid tags like <#VCHUDF...>
+            def fix_tag(m):
+                return m.group(0).replace('#', '_').replace(':', '_')
+            clean_xml = re.sub(r'</?#[^>]+>', fix_tag, clean_xml)
             
             root = ET.fromstring(clean_xml)
             data = []

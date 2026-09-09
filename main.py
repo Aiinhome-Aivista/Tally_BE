@@ -99,6 +99,7 @@ class ConfigSchema(BaseModel):
     scheduler_timing: Optional[str] = None
     file_format: Optional[str] = None
     request_xml: Optional[str] = None
+    parameters: Optional[dict] = None
 
 class TestConfigSchema(BaseModel):
     connection_name: Optional[str] = None
@@ -109,6 +110,7 @@ class TestConfigSchema(BaseModel):
     scheduler_timing: Optional[str] = None
     file_format: Optional[str] = None
     request_xml: Optional[str] = None
+    parameters: Optional[dict] = None
 
 class MysqlConfigSchema(BaseModel):
     host: str
@@ -150,7 +152,8 @@ def get_config(db: Session = Depends(get_db)):
             "report_name": config.report_name or "",
             "scheduler_timing": config.scheduler_timing or "",
             "file_format": config.file_format or "XML",
-            "request_xml": config.request_xml or ""
+            "request_xml": config.request_xml or "",
+            "parameters": config.parameters or {}
         })
     return result
 
@@ -170,6 +173,7 @@ def update_config(config_data: ConfigSchema, db: Session = Depends(get_db)):
     config.scheduler_timing = config_data.scheduler_timing
     config.file_format = config_data.file_format
     config.request_xml = config_data.request_xml
+    config.parameters = config_data.parameters
     db.add(config)
     db.commit()
     update_scheduler_job()
@@ -188,6 +192,7 @@ def modify_config(connection_name: str, config_data: ConfigSchema, db: Session =
     config.scheduler_timing = config_data.scheduler_timing
     config.file_format = config_data.file_format
     config.request_xml = config_data.request_xml
+    config.parameters = config_data.parameters
     db.commit()
     update_scheduler_job()
     return {"message": "Configuration updated successfully"}
@@ -227,10 +232,27 @@ def test_sync(test_data: Optional[TestConfigSchema] = None, db: Session = Depend
     
     # Run sync synchronously for testing feedback
     service = SyncService(db, host, port)
+    
+    # Pass parameters to service
+    parameters = test_data.parameters if test_data and test_data.parameters else None
+    
     try:
         if test_data and test_data.request_xml:
             # Send custom XML from UI
-            response_text = service.tally_service._send_request(test_data.request_xml)
+            request_xml = test_data.request_xml
+            if parameters:
+                for k, v in parameters.items():
+                    placeholder = f"{{{k}}}"
+                    if placeholder in request_xml:
+                        request_xml = request_xml.replace(placeholder, str(v))
+                    else:
+                        if "</STATICVARIABLES>" in request_xml.upper():
+                            import re
+                            injection = f"<{k}>{v}</{k}>\n</STATICVARIABLES>"
+                            request_xml = re.sub(r'</STATICVARIABLES>', injection, request_xml, flags=re.IGNORECASE)
+            import re
+            request_xml = re.sub(r'\{[A-Za-z0-9_]+\}', '', request_xml)
+            response_text = service.tally_service._send_request(request_xml)
             
             # Also test the dynamic DB engine insertion
             config = db.query(SyncConfig).first()
@@ -290,6 +312,8 @@ def start_sync(background_tasks: BackgroundTasks, test_data: Optional[TestConfig
         host = config.tally_host
         port = config.tally_port
         connection_name = config.connection_name
+        
+    parameters = test_data.parameters if test_data and test_data.parameters else None
 
     # Create the initial log entry
     log_entry = SyncLog(
@@ -304,18 +328,18 @@ def start_sync(background_tasks: BackgroundTasks, test_data: Optional[TestConfig
     log_id = log_entry.id
 
     # Fire background task
-    def background_sync_task(log_id, host, port, connection_name):
+    def background_sync_task(log_id, host, port, connection_name, parameters):
         # We need a new DB session for the background task
         engine = get_mysql_engine(next(get_local_db()))
         SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
         bg_db = SessionLocal()
         try:
             service = SyncService(bg_db, host, port)
-            service.run_sync(connection_name=connection_name, log_id=log_id)
+            service.run_sync(connection_name=connection_name, log_id=log_id, parameters=parameters)
         finally:
             bg_db.close()
 
-    background_tasks.add_task(background_sync_task, log_id, host, port, connection_name)
+    background_tasks.add_task(background_sync_task, log_id, host, port, connection_name, parameters)
     
     return {"status": "SUCCESS", "message": "Sync started.", "log_id": log_id}
 
