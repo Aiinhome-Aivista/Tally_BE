@@ -99,6 +99,8 @@ class ConfigSchema(BaseModel):
     scheduler_timing: Optional[str] = None
     file_format: Optional[str] = None
     request_xml: Optional[str] = None
+    unique_key_field: Optional[str] = None
+    dynamic_filters: Optional[dict] = None
 
 class TestConfigSchema(BaseModel):
     connection_name: Optional[str] = None
@@ -109,6 +111,8 @@ class TestConfigSchema(BaseModel):
     scheduler_timing: Optional[str] = None
     file_format: Optional[str] = None
     request_xml: Optional[str] = None
+    unique_key_field: Optional[str] = None
+    dynamic_filters: Optional[dict] = None
 
 class MysqlConfigSchema(BaseModel):
     host: str
@@ -150,7 +154,9 @@ def get_config(db: Session = Depends(get_db)):
             "report_name": config.report_name or "",
             "scheduler_timing": config.scheduler_timing or "",
             "file_format": config.file_format or "XML",
-            "request_xml": config.request_xml or ""
+            "request_xml": config.request_xml or "",
+            "unique_key_field": config.unique_key_field or "",
+            "dynamic_filters": json.loads(config.dynamic_filters) if config.dynamic_filters else {}
         })
     return result
 
@@ -168,8 +174,12 @@ def update_config(config_data: ConfigSchema, db: Session = Depends(get_db)):
     config.company_name = config_data.company_name
     config.report_name = config_data.report_name
     config.scheduler_timing = config_data.scheduler_timing
+    import json
     config.file_format = config_data.file_format
     config.request_xml = config_data.request_xml
+    config.unique_key_field = config_data.unique_key_field
+    if config_data.dynamic_filters:
+        config.dynamic_filters = json.dumps(config_data.dynamic_filters)
     db.add(config)
     db.commit()
     update_scheduler_job()
@@ -185,9 +195,13 @@ def modify_config(connection_name: str, config_data: ConfigSchema, db: Session =
     config.tally_port = config_data.tally_port
     config.company_name = config_data.company_name
     config.report_name = config_data.report_name
+    import json
     config.scheduler_timing = config_data.scheduler_timing
     config.file_format = config_data.file_format
     config.request_xml = config_data.request_xml
+    config.unique_key_field = config_data.unique_key_field
+    if config_data.dynamic_filters is not None:
+        config.dynamic_filters = json.dumps(config_data.dynamic_filters)
     db.commit()
     update_scheduler_job()
     return {"message": "Configuration updated successfully"}
@@ -240,7 +254,8 @@ def test_sync(test_data: Optional[TestConfigSchema] = None, db: Session = Depend
             records_count = len(parsed_data)
             
             if records_count > 0 and entity_name:
-                service.db_engine.sync_data(report_name, entity_name, parsed_data)
+                unique_key = test_data.unique_key_field if test_data and test_data.unique_key_field else (config.unique_key_field if config else None)
+                service.db_engine.sync_data(report_name, entity_name, parsed_data, unique_key_field=unique_key)
                 msg = f"Connection successful. {records_count} records saved to database table."
             else:
                 msg = "Connection successful, but no records found to save."
@@ -304,18 +319,19 @@ def start_sync(background_tasks: BackgroundTasks, test_data: Optional[TestConfig
     log_id = log_entry.id
 
     # Fire background task
-    def background_sync_task(log_id, host, port, connection_name):
+    def background_sync_task(log_id, host, port, connection_name, test_data_dict):
         # We need a new DB session for the background task
         engine = get_mysql_engine(next(get_local_db()))
         SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
         bg_db = SessionLocal()
         try:
             service = SyncService(bg_db, host, port)
-            service.run_sync(connection_name=connection_name, log_id=log_id)
+            service.run_sync(connection_name=connection_name, log_id=log_id, test_data_dict=test_data_dict)
         finally:
             bg_db.close()
 
-    background_tasks.add_task(background_sync_task, log_id, host, port, connection_name)
+    test_data_dict = test_data.dict() if test_data else None
+    background_tasks.add_task(background_sync_task, log_id, host, port, connection_name, test_data_dict)
     
     return {"status": "SUCCESS", "message": "Sync started.", "log_id": log_id}
 

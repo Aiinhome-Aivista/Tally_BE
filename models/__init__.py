@@ -18,6 +18,8 @@ class SyncConfig(Base):
     last_sync_time = Column(DateTime(timezone=True), default=None)
     status = Column(String(50), default="IDLE") # IDLE, SYNCING, ERROR
     last_alter_id = Column(Integer, default=0)
+    unique_key_field = Column(String(100), nullable=True)
+    dynamic_filters = Column(Text, nullable=True)
 
 class SyncLog(Base):
     __tablename__ = "sync_logs"

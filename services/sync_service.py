@@ -12,7 +12,7 @@ class SyncService:
         self.tally_service = TallyService(host, port)
         self.db_engine = DynamicDbEngine(db)
 
-    def run_sync(self, connection_name=None, log_id=None):
+    def run_sync(self, connection_name=None, log_id=None, test_data_dict=None):
         request_payload = None
         
         # If log_id is not provided (e.g., from scheduler), create one
@@ -57,6 +57,28 @@ class SyncService:
             if "{LAST_ALTER_ID}" in request_payload:
                 request_payload = request_payload.replace("{LAST_ALTER_ID}", str(last_alter_id))
                 logger.info(f"Replaced {{LAST_ALTER_ID}} with {last_alter_id}")
+                
+            if "{COMPANY_NAME}" in request_payload and config.company_name:
+                request_payload = request_payload.replace("{COMPANY_NAME}", config.company_name)
+                logger.info(f"Replaced {{COMPANY_NAME}} with {config.company_name}")
+            
+            import json
+            filters = {}
+            if test_data_dict and test_data_dict.get('dynamic_filters'):
+                filters = test_data_dict['dynamic_filters']
+            elif config.dynamic_filters:
+                try:
+                    filters = json.loads(config.dynamic_filters)
+                except Exception:
+                    pass
+                    
+            for k, v in filters.items():
+                placeholder = f"{{{k}}}"
+                if placeholder in request_payload:
+                    request_payload = request_payload.replace(placeholder, str(v))
+                    logger.info(f"Replaced {placeholder} with {v}")
+                    
+            unique_key = test_data_dict.get('unique_key_field') if test_data_dict else config.unique_key_field
             
             # Use streaming request
             response_stream = self.tally_service._send_request_stream(request_payload)
@@ -101,7 +123,7 @@ class SyncService:
                         xml_parts.append("</PREVIEW>")
                         preview_data = "\n".join(xml_parts)
                         
-                    self.db_engine.sync_data(report_name, entity_name, current_batch)
+                    self.db_engine.sync_data(report_name, entity_name, current_batch, unique_key_field=unique_key)
                     total_records += len(current_batch)
                         
                     logger.info(f"Inserted batch of {len(current_batch)} records. Total: {total_records}")
@@ -119,7 +141,7 @@ class SyncService:
                         xml_parts.append("  </RECORD>")
                     xml_parts.append("</PREVIEW>")
                     preview_data = "\n".join(xml_parts)
-                self.db_engine.sync_data(report_name, entity_name, current_batch)
+                self.db_engine.sync_data(report_name, entity_name, current_batch, unique_key_field=unique_key)
                 total_records += len(current_batch)
                 
             # Update last alter id in config
