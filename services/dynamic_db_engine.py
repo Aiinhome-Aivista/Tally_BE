@@ -143,14 +143,22 @@ class DynamicDbEngine:
         dynamic_table = Table(table_name, self.metadata, *db_columns)
         self.metadata.create_all(self.engine)
         
-        # Save metadata
-        new_meta = TallyTableMetadata(
-            report_name=report_name,
-            entity_name=entity_name,
-            table_name=table_name,
-            structure_hash=structure_hash
-        )
-        self.db.add(new_meta)
+        # Save or update metadata
+        existing_meta = self.db.query(TallyTableMetadata).filter_by(table_name=table_name).first()
+        if existing_meta:
+            existing_meta.report_name = report_name
+            existing_meta.entity_name = entity_name
+            existing_meta.structure_hash = structure_hash
+            existing_meta.last_sync_at = datetime.datetime.now()
+        else:
+            new_meta = TallyTableMetadata(
+                report_name=report_name,
+                entity_name=entity_name,
+                table_name=table_name,
+                structure_hash=structure_hash
+            )
+            self.db.add(new_meta)
+            
         self.db.commit()
         
         return dynamic_table
@@ -194,7 +202,7 @@ class DynamicDbEngine:
         if preferred_key and preferred_key in columns:
             return preferred_key
             
-        candidates = ['MASTERID', 'GUID', 'ALTERID', 'VOUCHERNUMBER', 'NAME']
+        candidates = ['VOUCHERMASTERID', 'MASTERID', 'GUID', 'ALTERID', 'VOUCHERNUMBER', 'NAME']
         for cand in candidates:
             if cand in columns:
                 return cand
