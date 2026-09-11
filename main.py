@@ -252,69 +252,80 @@ def get_logs(skip: int = 0, limit: int = 10, connection_name: Optional[str] = No
     return {"total": total, "logs": logs}
 
 @app.post("/api/sync/test")
-def test_sync(test_data: Optional[TestConfigSchema] = None, db: Session = Depends(get_db)):
+def test_sync(test_data: Optional[TestConfigSchema] = None, local_db: Session = Depends(get_local_db)):
     """Manually trigger a sync for testing."""
     if test_data and test_data.tally_host and test_data.tally_port:
         host = test_data.tally_host
         port = test_data.tally_port
     else:
-        config = db.query(SyncConfig).first()
-        if not config:
-            raise HTTPException(status_code=400, detail="Configuration not set")
-        host = config.tally_host
-        port = config.tally_port
-    
+        raise HTTPException(status_code=400, detail="Tally host and port are required")
+
+    # Try to get MySQL engine (optional — only needed if saving data)
+    mysql_db = None
+    try:
+        engine = get_mysql_engine(local_db)
+        SessionMySQL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        mysql_db = SessionMySQL()
+    except Exception:
+        mysql_db = None  # MySQL not configured yet — that's okay for XML preview
+
     # Run sync synchronously for testing feedback
-    service = SyncService(db, host, port)
+    service = SyncService(mysql_db, host, port)
     try:
         if test_data and test_data.request_xml:
             # Send custom XML from UI
             response_text = service.tally_service._send_request(test_data.request_xml)
-            
-            # Also test the dynamic DB engine insertion
-            config = db.query(SyncConfig).first()
-            report_name = config.report_name if config and config.report_name else "Manual_Test_Report"
-            
+
             parsed_data, entity_name = service.tally_service.parse_xml_to_dict(response_text)
             records_count = len(parsed_data)
-            
-            if records_count > 0 and entity_name:
+
+            if records_count > 0 and entity_name and mysql_db:
+                config = mysql_db.query(SyncConfig).first()
+                report_name = config.report_name if config and config.report_name else "Manual_Test_Report"
                 unique_key = test_data.unique_key_field if test_data and test_data.unique_key_field else (config.unique_key_field if config else None)
                 service.db_engine.sync_data(report_name, entity_name, parsed_data, unique_key_field=unique_key)
                 msg = f"Connection successful. {records_count} records saved to database table."
+            elif records_count > 0:
+                msg = f"Connection successful. {records_count} records found. (Configure MySQL to save data)"
             else:
                 msg = "Connection successful, but no records found to save."
-                
-            # Log success
-            log_entry = SyncLog(
-                connection_name=test_data.connection_name if test_data else None,
-                status="SUCCESS", 
-                message=msg, 
-                records_fetched=records_count,
-                request_payload=test_data.request_xml[:50000] if test_data and test_data.request_xml else None,
-                response_payload=response_text[:50000] if response_text else None
-            )
-            db.add(log_entry)
-            db.commit()
-            
+
+            # Log success (only if MySQL available)
+            if mysql_db:
+                log_entry = SyncLog(
+                    connection_name=test_data.connection_name if test_data else None,
+                    status="SUCCESS",
+                    message=msg,
+                    records_fetched=records_count,
+                    request_payload=test_data.request_xml[:50000] if test_data and test_data.request_xml else None,
+                    response_payload=response_text[:50000] if response_text else None
+                )
+                mysql_db.add(log_entry)
+                mysql_db.commit()
+
             return {"status": "SUCCESS", "message": msg, "response_xml": response_text}
         else:
             # Default check connection
             service.tally_service.get_ledgers()
             return {"status": "SUCCESS", "message": "Connection to Tally successful."}
     except Exception as e:
-        request_payload = test_data.request_xml if test_data else None
-        log_entry = SyncLog(
-            connection_name=test_data.connection_name if test_data else None,
-            status="ERROR", 
-            message=str(e), 
-            records_fetched=0,
-            request_payload=request_payload[:50000] if request_payload else None,
-            response_payload=None
-        )
-        db.add(log_entry)
-        db.commit()
+        if mysql_db:
+            request_payload = test_data.request_xml if test_data else None
+            log_entry = SyncLog(
+                connection_name=test_data.connection_name if test_data else None,
+                status="ERROR",
+                message=str(e),
+                records_fetched=0,
+                request_payload=request_payload[:50000] if request_payload else None,
+                response_payload=None
+            )
+            mysql_db.add(log_entry)
+            mysql_db.commit()
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        if mysql_db:
+            mysql_db.close()
+
 
 @app.post("/api/sync/start")
 def start_sync(background_tasks: BackgroundTasks, test_data: Optional[TestConfigSchema] = None, db: Session = Depends(get_db)):
