@@ -195,6 +195,11 @@ def modify_config(connection_name: str, config_data: ConfigSchema, db: Session =
     config.tally_host = config_data.tally_host
     config.tally_port = config_data.tally_port
     config.company_name = config_data.company_name
+    
+    # If the user changed the report name, reset last_alter_id to 0
+    if config.report_name != config_data.report_name:
+        config.last_alter_id = 0
+        
     config.report_name = config_data.report_name
     import json
     config.scheduler_timing = config_data.scheduler_timing

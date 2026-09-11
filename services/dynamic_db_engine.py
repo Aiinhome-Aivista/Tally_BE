@@ -55,7 +55,17 @@ def detect_column_type(values: List[str]):
                 except ValueError:
                     is_date = False
             else:
-                is_date = False
+                # Try other common formats like 2-Apr-25, 2-Apr-2025, YYYY-MM-DD
+                parsed = False
+                for fmt in ("%d-%b-%y", "%d-%b-%Y", "%Y-%m-%d", "%d-%m-%Y"):
+                    try:
+                        datetime.datetime.strptime(val_str, fmt)
+                        parsed = True
+                        break
+                    except ValueError:
+                        continue
+                if not parsed:
+                    is_date = False
                 
         if not is_int and not is_float and not is_date:
             return Text
@@ -242,7 +252,16 @@ class DynamicDbEngine:
                                 except ValueError:
                                     v = None
                             else:
-                                v = None
+                                parsed = False
+                                for fmt in ("%d-%b-%y", "%d-%b-%Y", "%Y-%m-%d", "%d-%m-%Y"):
+                                    try:
+                                        v = datetime.datetime.strptime(v_str, fmt).date()
+                                        parsed = True
+                                        break
+                                    except ValueError:
+                                        continue
+                                if not parsed:
+                                    v = None
                         elif col_type in (DOUBLE, Float) or actual_db_type in (DOUBLE, Float):
                             v_clean = v_str.replace("(-)", "-")
                             if v_clean == "":
