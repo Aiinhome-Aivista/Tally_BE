@@ -2,6 +2,7 @@ import hashlib
 import logging
 from typing import List, Dict, Tuple
 from sqlalchemy import Table, Column, Integer, String, Text, MetaData, select, inspect, func, text, Float, BigInteger, Date
+from sqlalchemy.dialects.mysql import DOUBLE
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.mysql import insert
 import datetime
@@ -13,7 +14,12 @@ from models import TallyTableMetadata
 logger = logging.getLogger(__name__)
 
 def detect_column_type(values: List[str]):
-    """Global function to detect SQL data type based on sample values."""
+    """Detect SQL data type from sample values.
+    - Returns DOUBLE for decimal numbers (handles Tally's (-) negative format)
+    - Returns BigInteger for whole numbers
+    - Returns Date for YYYYMMDD date strings
+    - Returns Text for everything else
+    """
     if not values:
         return Text
 
@@ -21,23 +27,24 @@ def detect_column_type(values: List[str]):
     if not valid_values:
         return Text
 
-    is_int = True
+    is_int   = True
     is_float = True
-    is_date = True
+    is_date  = True
 
     for val in valid_values:
-        val_str = str(val).strip()
-        clean_val_str = val_str.replace("(-)", "-")
+        val_str   = str(val).strip()
+        # Tally encodes negative numbers as "(-)<number>" e.g. "(-)1234.56"
+        clean_val = val_str.replace("(-)", "-")
         
         if is_int:
             try:
-                int(clean_val_str)
+                int(clean_val)
             except ValueError:
                 is_int = False
                 
         if is_float:
             try:
-                float(clean_val_str)
+                float(clean_val)
             except ValueError:
                 is_float = False
                 
@@ -53,10 +60,11 @@ def detect_column_type(values: List[str]):
         if not is_int and not is_float and not is_date:
             return Text
 
-    if is_int:
+    # Priority: int → float → date → text
+    if is_int and not is_date:
         return BigInteger
     if is_float:
-        return Float
+        return DOUBLE   # Use DOUBLE (not FLOAT) for full precision
     if is_date:
         return Date
 
@@ -96,8 +104,8 @@ class DynamicDbEngine:
                         col_type = column_types.get(col_name, Text)
                         if col_type == BigInteger:
                             sql_type = "BIGINT"
-                        elif col_type == Float:
-                            sql_type = "FLOAT"
+                        elif col_type == DOUBLE or col_type == Float:
+                            sql_type = "DOUBLE"
                         elif col_type == Date:
                             sql_type = "DATE"
                         else:
@@ -191,18 +199,21 @@ class DynamicDbEngine:
                                     v = datetime.datetime.strptime(v_str, "%Y%m%d").date()
                                 except ValueError:
                                     pass
-                        elif col_type == Float:
+                        elif col_type == DOUBLE or col_type == Float:
                             v_str = str(v).strip().replace("(-)", "-")
                             try:
                                 v = float(v_str)
                             except ValueError:
-                                pass
+                                v = None
                         elif col_type == BigInteger:
                             v_str = str(v).strip().replace("(-)", "-")
                             try:
                                 v = int(v_str)
                             except ValueError:
-                                pass
+                                try:
+                                    v = int(float(v_str))
+                                except ValueError:
+                                    v = None
                                 
                     clean_item[safe_k] = v
                 clean_data.append(clean_item)

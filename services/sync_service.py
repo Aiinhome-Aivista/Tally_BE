@@ -85,22 +85,30 @@ class SyncService:
             
             # Parse and insert dynamically in chunks
             batch_size = 5000
-            current_batch = []
+            # Key: entity_name → list of records for that entity
+            entity_batches: dict = {}
             total_records = 0
             max_alter_id = last_alter_id
             preview_data = None
+            first_entity = None
             
             for item_data, entity_name in self.tally_service.parse_xml_iteratively(response_stream):
-                current_batch.append(item_data)
+                if first_entity is None:
+                    first_entity = entity_name
                 
-                # Update progress in DB every 100 rows for smooth UI animation
-                if len(current_batch) % 100 == 0:
+                if entity_name not in entity_batches:
+                    entity_batches[entity_name] = []
+                entity_batches[entity_name].append(item_data)
+                
+                # Update progress every 100 rows
+                batch_total = sum(len(b) for b in entity_batches.values())
+                if batch_total % 100 == 0:
                     log_entry = self.db.query(SyncLog).filter(SyncLog.id == log_id).first()
                     if log_entry:
-                        log_entry.records_fetched = total_records + len(current_batch)
+                        log_entry.records_fetched = total_records + batch_total
                         self.db.commit()
                         
-                # Update max alter id
+                # Track max alter id
                 for key, val in item_data.items():
                     if key.upper() in ["ALTERID", "ATTR_ALTERID"]:
                         try:
@@ -110,11 +118,13 @@ class SyncService:
                         except (ValueError, TypeError):
                             pass
                 
-                # If batch size reached, insert to DB
-                if len(current_batch) >= batch_size:
-                    if total_records == 0:
+                # Flush the batch for this specific entity when it reaches batch_size
+                if len(entity_batches[entity_name]) >= batch_size:
+                    batch = entity_batches[entity_name]
+                    
+                    if total_records == 0 and entity_name == first_entity:
                         xml_parts = ["<PREVIEW>"]
-                        for item in current_batch:
+                        for item in batch[:20]:
                             xml_parts.append("  <RECORD>")
                             for k, v in item.items():
                                 safe_k = ''.join(c for c in k if c.isalnum() or c == '_')
@@ -122,18 +132,19 @@ class SyncService:
                             xml_parts.append("  </RECORD>")
                         xml_parts.append("</PREVIEW>")
                         preview_data = "\n".join(xml_parts)
-                        
-                    self.db_engine.sync_data(report_name, entity_name, current_batch, unique_key_field=unique_key)
-                    total_records += len(current_batch)
-                        
-                    logger.info(f"Inserted batch of {len(current_batch)} records. Total: {total_records}")
-                    current_batch = [] # Reset batch
+                    
+                    self.db_engine.sync_data(report_name, entity_name, batch, unique_key_field=unique_key)
+                    total_records += len(batch)
+                    logger.info(f"[{entity_name}] Inserted batch of {len(batch)} records. Total: {total_records}")
+                    entity_batches[entity_name] = []
             
-            # Process remaining items
-            if current_batch and entity_name:
-                if total_records == 0:
+            # Process remaining items in all entity batches
+            for ename, batch in entity_batches.items():
+                if not batch:
+                    continue
+                if total_records == 0 and ename == first_entity:
                     xml_parts = ["<PREVIEW>"]
-                    for item in current_batch:
+                    for item in batch[:20]:
                         xml_parts.append("  <RECORD>")
                         for k, v in item.items():
                             safe_k = ''.join(c for c in k if c.isalnum() or c == '_')
@@ -141,8 +152,9 @@ class SyncService:
                         xml_parts.append("  </RECORD>")
                     xml_parts.append("</PREVIEW>")
                     preview_data = "\n".join(xml_parts)
-                self.db_engine.sync_data(report_name, entity_name, current_batch, unique_key_field=unique_key)
-                total_records += len(current_batch)
+                self.db_engine.sync_data(report_name, ename, batch, unique_key_field=unique_key)
+                total_records += len(batch)
+                logger.info(f"[{ename}] Final batch of {len(batch)} records. Total: {total_records}")
                 
             # Update last alter id in config
             if max_alter_id > (config.last_alter_id or 0):
