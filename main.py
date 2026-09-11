@@ -160,6 +160,13 @@ def get_config(local_db: Session = Depends(get_local_db)):
             configs = mysql_db.query(SyncConfig).all()
             result = []
             for config in configs:
+                db_name = mysql_config.database_name if mysql_config else ""
+                if not db_name and config.company_name:
+                    import re
+                    # Same logic as frontend generateDbName
+                    db_name = re.sub(r'[^a-z0-9]', '_', config.company_name.lower())
+                    db_name = re.sub(r'_+', '_', db_name).strip('_')
+
                 result.append({
                     "connection_name": config.connection_name,
                     "tally_host": config.tally_host,
@@ -171,7 +178,7 @@ def get_config(local_db: Session = Depends(get_local_db)):
                     "request_xml": config.request_xml or "",
                     "unique_key_field": config.unique_key_field or "",
                     "dynamic_filters": json.loads(config.dynamic_filters) if config.dynamic_filters else {},
-                    "database_name": mysql_config.database_name if mysql_config else ""
+                    "database_name": db_name
                 })
             return result
         finally:
