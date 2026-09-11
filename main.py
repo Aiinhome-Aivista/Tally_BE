@@ -114,6 +114,7 @@ class TestConfigSchema(BaseModel):
     request_xml: Optional[str] = None
     unique_key_field: Optional[str] = None
     dynamic_filters: Optional[dict] = None
+    database_name: Optional[str] = None
 
 class MysqlConfigSchema(BaseModel):
     host: str
@@ -145,6 +146,7 @@ def get_tables(db: Session = Depends(get_db)):
 @app.get("/api/config", response_model=List[ConfigSchema])
 def get_config(db: Session = Depends(get_db)):
     configs = db.query(SyncConfig).all()
+    mysql_config = db.query(MysqlConfig).first()
     result = []
     for config in configs:
         result.append({
@@ -157,7 +159,8 @@ def get_config(db: Session = Depends(get_db)):
             "file_format": config.file_format or "XML",
             "request_xml": config.request_xml or "",
             "unique_key_field": config.unique_key_field or "",
-            "dynamic_filters": json.loads(config.dynamic_filters) if config.dynamic_filters else {}
+            "dynamic_filters": json.loads(config.dynamic_filters) if config.dynamic_filters else {},
+            "database_name": mysql_config.database_name if mysql_config else ""
         })
     return result
 
