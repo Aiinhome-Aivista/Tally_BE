@@ -145,24 +145,40 @@ def get_tables(db: Session = Depends(get_db)):
 
 @app.get("/api/config", response_model=List[ConfigSchema])
 def get_config(local_db: Session = Depends(get_local_db)):
-    configs = local_db.query(SyncConfig).all()
+    # MysqlConfig is always in SQLite
     mysql_config = local_db.query(MysqlConfig).first()
-    result = []
-    for config in configs:
-        result.append({
-            "connection_name": config.connection_name,
-            "tally_host": config.tally_host, 
-            "tally_port": config.tally_port,
-            "company_name": config.company_name or "",
-            "report_name": config.report_name or "",
-            "scheduler_timing": config.scheduler_timing or "",
-            "file_format": config.file_format or "XML",
-            "request_xml": config.request_xml or "",
-            "unique_key_field": config.unique_key_field or "",
-            "dynamic_filters": json.loads(config.dynamic_filters) if config.dynamic_filters else {},
-            "database_name": mysql_config.database_name if mysql_config else ""
-        })
-    return result
+    if not mysql_config:
+        return []  # MySQL not configured yet — return empty list gracefully
+
+    # SyncConfig is in MySQL
+    try:
+        engine = get_mysql_engine(local_db)
+        SessionMySQL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        mysql_db = SessionMySQL()
+        try:
+            configs = mysql_db.query(SyncConfig).all()
+            result = []
+            for config in configs:
+                result.append({
+                    "connection_name": config.connection_name,
+                    "tally_host": config.tally_host,
+                    "tally_port": config.tally_port,
+                    "company_name": config.company_name or "",
+                    "report_name": config.report_name or "",
+                    "scheduler_timing": config.scheduler_timing or "",
+                    "file_format": config.file_format or "XML",
+                    "request_xml": config.request_xml or "",
+                    "unique_key_field": config.unique_key_field or "",
+                    "dynamic_filters": json.loads(config.dynamic_filters) if config.dynamic_filters else {},
+                    "database_name": mysql_config.database_name if mysql_config else ""
+                })
+            return result
+        finally:
+            mysql_db.close()
+    except Exception as e:
+        logger.error(f"Failed to fetch config from MySQL: {e}")
+        return []
+
 
 @app.post("/api/config")
 def update_config(config_data: ConfigSchema, db: Session = Depends(get_db)):
