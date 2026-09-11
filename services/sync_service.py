@@ -54,6 +54,13 @@ class SyncService:
                 raise Exception("No request_xml found in config.")
                 
             last_alter_id = config.last_alter_id or 0
+            
+            # Dynamically fetch max alter ID from the actual data table
+            db_max_alter_id = self.db_engine.get_max_alter_id(report_name)
+            if db_max_alter_id > last_alter_id:
+                last_alter_id = db_max_alter_id
+                logger.info(f"Using actual max alter ID {last_alter_id} from database table.")
+                
             if "{LAST_ALTER_ID}" in request_payload:
                 request_payload = request_payload.replace("{LAST_ALTER_ID}", str(last_alter_id))
                 logger.info(f"Replaced {{LAST_ALTER_ID}} with {last_alter_id}")
@@ -108,9 +115,9 @@ class SyncService:
                         log_entry.records_fetched = total_records + batch_total
                         self.db.commit()
                         
-                # Track max alter id
+                # Track max alter id dynamically across any column containing 'ALTERID'
                 for key, val in item_data.items():
-                    if key.upper() in ["ALTERID", "ATTR_ALTERID"]:
+                    if "ALTERID" in key.upper():
                         try:
                             aid = int(val)
                             if aid > max_alter_id:

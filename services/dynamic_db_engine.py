@@ -145,6 +145,40 @@ class DynamicDbEngine:
         
         return dynamic_table
 
+    def get_max_alter_id(self, report_name: str) -> int:
+        """Finds the alterid column dynamically and returns its max value."""
+        meta = self.db.query(TallyTableMetadata).filter_by(report_name=report_name).first()
+        if not meta:
+            return 0
+            
+        table_name = meta.table_name
+        inspector = inspect(self.engine)
+        if not inspector.has_table(table_name):
+            return 0
+            
+        columns = [col['name'].lower() for col in inspector.get_columns(table_name)]
+        
+        # Find alterid column (e.g. alterid, varalterid, attr_alterid)
+        alter_col = None
+        for col in columns:
+            if 'alterid' in col:
+                alter_col = col
+                break
+                
+        if not alter_col:
+            return 0
+            
+        with self.engine.connect() as conn:
+            try:
+                query = text(f"SELECT MAX(`{alter_col}`) FROM `{table_name}`")
+                result = conn.execute(query).scalar()
+                if result:
+                    return int(result)
+            except Exception as e:
+                logger.warning(f"Failed to get max alter id from {table_name}. Error: {e}")
+                
+        return 0
+
     def _determine_unique_key(self, columns: List[str], preferred_key: str = None) -> str:
         """Find the best unique key available in the dataset."""
         if preferred_key and preferred_key in columns:
