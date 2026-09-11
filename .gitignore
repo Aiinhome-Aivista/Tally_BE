@@ -4,3 +4,4 @@ env
 __pycache__
 /lib
 *.zip
+data/*.db
