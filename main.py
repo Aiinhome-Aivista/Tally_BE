@@ -144,9 +144,9 @@ def get_tables(db: Session = Depends(get_db)):
     return {"tables": inspector.get_table_names(), "schema": schema, "url": str(engine.url).replace(engine.url.password, '***') if engine.url.password else str(engine.url)}
 
 @app.get("/api/config", response_model=List[ConfigSchema])
-def get_config(db: Session = Depends(get_db)):
-    configs = db.query(SyncConfig).all()
-    mysql_config = db.query(MysqlConfig).first()
+def get_config(local_db: Session = Depends(get_local_db)):
+    configs = local_db.query(SyncConfig).all()
+    mysql_config = local_db.query(MysqlConfig).first()
     result = []
     for config in configs:
         result.append({
