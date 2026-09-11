@@ -102,6 +102,7 @@ class ConfigSchema(BaseModel):
     request_xml: Optional[str] = None
     unique_key_field: Optional[str] = None
     dynamic_filters: Optional[dict] = None
+    database_name: Optional[str] = None
 
 class TestConfigSchema(BaseModel):
     connection_name: Optional[str] = None
