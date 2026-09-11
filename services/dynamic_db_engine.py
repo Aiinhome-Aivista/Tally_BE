@@ -180,8 +180,13 @@ class DynamicDbEngine:
         # Get or create table
         dynamic_table = self._get_or_create_table(report_name, entity_name, all_columns, column_types)
         
+        # Query actual column types from dynamic_table to know real DB types
+        db_column_types = {}
+        for c in dynamic_table.columns:
+            db_column_types[c.name] = type(c.type)
+
         unique_key = self._determine_unique_key(all_columns, preferred_key=unique_key_field)
-        
+
         with self.engine.connect() as conn:
             # Clean up dict keys to match column names (safe_col_name)
             clean_data = []
@@ -191,29 +196,42 @@ class DynamicDbEngine:
                     safe_k = ''.join(c for c in k if c.isalnum() or c == '_')
                     
                     if v is not None:
+                        # Check detected type or existing DB column type
                         col_type = column_types.get(k)
-                        if col_type == Date:
-                            v_str = str(v).strip()
+                        actual_db_type = db_column_types.get(safe_k)
+                        
+                        v_str = str(v).strip()
+                        if col_type == Date or actual_db_type == Date:
                             if len(v_str) == 8 and v_str.isdigit():
                                 try:
                                     v = datetime.datetime.strptime(v_str, "%Y%m%d").date()
                                 except ValueError:
-                                    pass
-                        elif col_type == DOUBLE or col_type == Float:
-                            v_str = str(v).strip().replace("(-)", "-")
-                            try:
-                                v = float(v_str)
-                            except ValueError:
+                                    v = None
+                            else:
                                 v = None
-                        elif col_type == BigInteger:
-                            v_str = str(v).strip().replace("(-)", "-")
-                            try:
-                                v = int(v_str)
-                            except ValueError:
+                        elif col_type in (DOUBLE, Float) or actual_db_type in (DOUBLE, Float):
+                            v_clean = v_str.replace("(-)", "-")
+                            if v_clean == "":
+                                v = None
+                            else:
                                 try:
-                                    v = int(float(v_str))
+                                    v = float(v_clean)
                                 except ValueError:
                                     v = None
+                        elif col_type == BigInteger or actual_db_type in (BigInteger, Integer):
+                            v_clean = v_str.replace("(-)", "-")
+                            if v_clean == "":
+                                v = None
+                            else:
+                                try:
+                                    v = int(v_clean)
+                                except ValueError:
+                                    try:
+                                        v = int(float(v_clean))
+                                    except ValueError:
+                                        v = None
+                    else:
+                        v = None
                                 
                     clean_item[safe_k] = v
                 clean_data.append(clean_item)
