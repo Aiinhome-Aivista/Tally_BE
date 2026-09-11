@@ -254,6 +254,8 @@ def get_logs(skip: int = 0, limit: int = 10, connection_name: Optional[str] = No
 @app.post("/api/sync/test")
 def test_sync(test_data: Optional[TestConfigSchema] = None, local_db: Session = Depends(get_local_db)):
     """Manually trigger a sync for testing."""
+    from services.tally_service import TallyService
+
     if test_data and test_data.tally_host and test_data.tally_port:
         host = test_data.tally_host
         port = test_data.tally_port
@@ -267,19 +269,21 @@ def test_sync(test_data: Optional[TestConfigSchema] = None, local_db: Session = 
         SessionMySQL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
         mysql_db = SessionMySQL()
     except Exception:
-        mysql_db = None  # MySQL not configured yet — that's okay for XML preview
+        mysql_db = None  # MySQL not configured yet — okay for XML preview
 
-    # Run sync synchronously for testing feedback
-    service = SyncService(mysql_db, host, port)
+    # TallyService does NOT need DB — use it directly
+    tally_service = TallyService(host, port)
+
     try:
         if test_data and test_data.request_xml:
-            # Send custom XML from UI
-            response_text = service.tally_service._send_request(test_data.request_xml)
-
-            parsed_data, entity_name = service.tally_service.parse_xml_to_dict(response_text)
+            # Send custom XML to Tally
+            response_text = tally_service._send_request(test_data.request_xml)
+            parsed_data, entity_name = tally_service.parse_xml_to_dict(response_text)
             records_count = len(parsed_data)
 
             if records_count > 0 and entity_name and mysql_db:
+                # Save to MySQL only if configured
+                service = SyncService(mysql_db, host, port)
                 config = mysql_db.query(SyncConfig).first()
                 report_name = config.report_name if config and config.report_name else "Manual_Test_Report"
                 unique_key = test_data.unique_key_field if test_data and test_data.unique_key_field else (config.unique_key_field if config else None)
@@ -290,7 +294,7 @@ def test_sync(test_data: Optional[TestConfigSchema] = None, local_db: Session = 
             else:
                 msg = "Connection successful, but no records found to save."
 
-            # Log success (only if MySQL available)
+            # Log (only if MySQL available)
             if mysql_db:
                 log_entry = SyncLog(
                     connection_name=test_data.connection_name if test_data else None,
@@ -305,18 +309,17 @@ def test_sync(test_data: Optional[TestConfigSchema] = None, local_db: Session = 
 
             return {"status": "SUCCESS", "message": msg, "response_xml": response_text}
         else:
-            # Default check connection
-            service.tally_service.get_ledgers()
+            # Just test Tally connectivity
+            tally_service.get_ledgers()
             return {"status": "SUCCESS", "message": "Connection to Tally successful."}
     except Exception as e:
         if mysql_db:
-            request_payload = test_data.request_xml if test_data else None
             log_entry = SyncLog(
                 connection_name=test_data.connection_name if test_data else None,
                 status="ERROR",
                 message=str(e),
                 records_fetched=0,
-                request_payload=request_payload[:50000] if request_payload else None,
+                request_payload=(test_data.request_xml[:50000] if test_data and test_data.request_xml else None),
                 response_payload=None
             )
             mysql_db.add(log_entry)
