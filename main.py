@@ -2,6 +2,14 @@ import logging
 import json
 import os
 import sys
+
+# Fix for PyInstaller noconsole/windowed mode where sys.stdout and sys.stderr are None
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+if sys.stdin is None:
+    sys.stdin = open(os.devnull, "r", encoding="utf-8")
 import threading
 import subprocess
 import uvicorn
@@ -526,8 +534,6 @@ def validate_mysql_config(config_data: MysqlConfigSchema):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Connection error: {str(e)}")
 
-import os
-import sys
 import webbrowser
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
