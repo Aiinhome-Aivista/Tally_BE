@@ -553,10 +553,15 @@ if os.path.exists(dist_dir):
 
     @app.get("/{full_path:path}")
     async def serve_react_app(full_path: str):
+        no_cache_headers = {
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
         file_path = os.path.join(dist_dir, full_path)
         if os.path.exists(file_path) and os.path.isfile(file_path):
-            return FileResponse(file_path)
-        return FileResponse(os.path.join(dist_dir, "index.html"))
+            return FileResponse(file_path, headers=no_cache_headers)
+        return FileResponse(os.path.join(dist_dir, "index.html"), headers=no_cache_headers)
 
 if __name__ == "__main__":
     import time
