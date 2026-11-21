@@ -1,5 +1,17 @@
 import logging
 import json
+import os
+import sys
+
+# Fix for PyInstaller noconsole/windowed mode where sys.stdout and sys.stderr are None
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+if sys.stdin is None:
+    sys.stdin = open(os.devnull, "r", encoding="utf-8")
+import threading
+import subprocess
 import uvicorn
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,9 +30,21 @@ from models import SyncConfig, SyncLog, MysqlConfig
 from scheduler import start_scheduler, stop_scheduler, sync_job, update_scheduler_job
 from services.sync_service import SyncService
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# Automatically cleanup any existing stuck instances or port conflicts on Windows
+if sys.platform == "win32":
+    try:
+        current_pid = os.getpid()
+        # Find and kill other TallySyncApp processes except current
+        subprocess.run(
+            f'powershell -Command "Get-Process -Name TallySyncApp -ErrorAction SilentlyContinue | Where-Object {{ $_.Id -ne {current_pid} }} | Stop-Process -Force -ErrorAction SilentlyContinue"',
+            shell=True,
+            capture_output=True
+        )
+    except Exception:
+        pass
 
 # Create local tables
 LocalBase.metadata.create_all(bind=sqlite_engine)
@@ -103,6 +127,7 @@ class ConfigSchema(BaseModel):
     unique_key_field: Optional[str] = None
     dynamic_filters: Optional[dict] = None
     database_name: Optional[str] = None
+    total_rows: Optional[int] = 0
 
 class TestConfigSchema(BaseModel):
     connection_name: Optional[str] = None
@@ -157,6 +182,10 @@ def get_config(local_db: Session = Depends(get_local_db)):
         SessionMySQL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
         mysql_db = SessionMySQL()
         try:
+            from sqlalchemy import inspect
+            inspector = inspect(engine)
+            existing_tables = set(inspector.get_table_names())
+
             configs = mysql_db.query(SyncConfig).all()
             result = []
             for config in configs:
@@ -166,6 +195,25 @@ def get_config(local_db: Session = Depends(get_local_db)):
                     # Same logic as frontend generateDbName
                     db_name = re.sub(r'[^a-z0-9]', '_', config.company_name.lower())
                     db_name = re.sub(r'_+', '_', db_name).strip('_')
+
+                # Calculate total rows in the target table
+                table_name = ''.join(c for c in (config.report_name or "").lower() if c.isalnum() or c == '_')
+                total_rows = 0
+                if table_name and table_name in existing_tables:
+                    try:
+                        row_count = mysql_db.execute(text(f"SELECT COUNT(*) FROM `{table_name}`")).scalar()
+                        total_rows = int(row_count) if row_count is not None else 0
+                    except Exception:
+                        total_rows = 0
+
+                # Fallback to max / latest positive records_fetched from logs if table count is 0
+                if total_rows == 0:
+                    last_valid_log = mysql_db.query(SyncLog).filter(
+                        SyncLog.connection_name == config.connection_name,
+                        SyncLog.records_fetched > 0
+                    ).order_by(SyncLog.timestamp.desc()).first()
+                    if last_valid_log:
+                        total_rows = last_valid_log.records_fetched or 0
 
                 result.append({
                     "connection_name": config.connection_name,
@@ -178,7 +226,8 @@ def get_config(local_db: Session = Depends(get_local_db)):
                     "request_xml": config.request_xml or "",
                     "unique_key_field": config.unique_key_field or "",
                     "dynamic_filters": json.loads(config.dynamic_filters) if config.dynamic_filters else {},
-                    "database_name": db_name
+                    "database_name": db_name,
+                    "total_rows": total_rows
                 })
             return result
         finally:
@@ -238,6 +287,19 @@ def modify_config(connection_name: str, config_data: ConfigSchema, db: Session =
     db.commit()
     update_scheduler_job()
     return {"message": "Configuration updated successfully"}
+
+class ToggleSchedulerSchema(BaseModel):
+    scheduler_timing: Optional[str] = "5"
+
+@app.post("/api/config/{connection_name}/toggle-scheduler")
+def toggle_scheduler(connection_name: str, payload: ToggleSchedulerSchema, db: Session = Depends(get_db)):
+    config = db.query(SyncConfig).filter(SyncConfig.connection_name == connection_name).first()
+    if not config:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    config.scheduler_timing = payload.scheduler_timing
+    db.commit()
+    update_scheduler_job()
+    return {"message": "Scheduler updated successfully", "scheduler_timing": config.scheduler_timing}
 
 @app.delete("/api/config/{connection_name}")
 def delete_config(connection_name: str, db: Session = Depends(get_db)):
@@ -304,8 +366,19 @@ def test_sync(test_data: Optional[TestConfigSchema] = None, local_db: Session = 
 
             # Log (only if MySQL available)
             if mysql_db:
+                conn_name = test_data.connection_name if test_data else None
+                if records_count == 0 and conn_name:
+                    latest_prior_log = mysql_db.query(SyncLog).filter(
+                        SyncLog.connection_name == conn_name
+                    ).order_by(SyncLog.timestamp.desc()).first()
+                    if latest_prior_log and latest_prior_log.status == "SUCCESS" and (latest_prior_log.records_fetched or 0) == 0:
+                        latest_prior_log.timestamp = func.now()
+                        latest_prior_log.message = msg
+                        mysql_db.commit()
+                        return {"status": "SUCCESS", "message": msg, "response_xml": response_text}
+
                 log_entry = SyncLog(
-                    connection_name=test_data.connection_name if test_data else None,
+                    connection_name=conn_name,
                     status="SUCCESS",
                     message=msg,
                     records_fetched=records_count,
@@ -461,12 +534,104 @@ def validate_mysql_config(config_data: MysqlConfigSchema):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Connection error: {str(e)}")
 
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+import webbrowser
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
-#     VCHLEVEL --- 3125 
-# VCHINV --- 130252 
-# VCHLED --- 11434  
-# VCHBILLALLO --- 4913  
-# VCHCC ---  5  
-# VCHINOUT ---39,515
+# Determine base directory for PyInstaller or normal run
+if getattr(sys, 'frozen', False):
+    BASE_DIR = sys._MEIPASS
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+dist_dir = os.path.join(BASE_DIR, "frontend_dist")
+
+if os.path.exists(dist_dir):
+    assets_path = os.path.join(dist_dir, "assets")
+    if os.path.exists(assets_path):
+        app.mount("/assets", StaticFiles(directory=assets_path), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_react_app(full_path: str):
+        no_cache_headers = {
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+        file_path = os.path.join(dist_dir, full_path)
+        if os.path.exists(file_path) and os.path.isfile(file_path):
+            return FileResponse(file_path, headers=no_cache_headers)
+        return FileResponse(os.path.join(dist_dir, "index.html"), headers=no_cache_headers)
+
+if __name__ == "__main__":
+    import time
+    import socket
+    import webbrowser
+
+    def wait_for_server(host="127.0.0.1", port=5009, timeout=25):
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                with socket.create_connection((host, port), timeout=0.5):
+                    return True
+            except OSError:
+                time.sleep(0.3)
+        return False
+
+    def start_app_window():
+        # Only launch desktop window and hide console if packaged as a frozen .exe
+        if not getattr(sys, 'frozen', False):
+            return
+
+        # Wait until FastAPI server is completely bound and accepting HTTP requests
+        wait_for_server("127.0.0.1", 5009, timeout=25)
+        time.sleep(0.4)
+        url = "http://127.0.0.1:5009"
+        
+        # Hide the console window safely AFTER server initialization has started
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                hWnd = ctypes.windll.kernel32.GetConsoleWindow()
+                if hWnd != 0:
+                    ctypes.windll.user32.ShowWindow(hWnd, 0)
+            except Exception:
+                pass
+
+        # 1. Try launching in pure App Window Mode (Edge)
+        edge_candidates = [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe")
+        ]
+        for edge_exe in edge_candidates:
+            if os.path.exists(edge_exe):
+                try:
+                    subprocess.Popen([edge_exe, f"--app={url}", "--window-size=1280,800"])
+                    return
+                except Exception:
+                    pass
+
+        # 2. Try Chrome App Window Mode
+        chrome_candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe")
+        ]
+        for chrome_exe in chrome_candidates:
+            if os.path.exists(chrome_exe):
+                try:
+                    subprocess.Popen([chrome_exe, f"--app={url}", "--window-size=1280,800"])
+                    return
+                except Exception:
+                    pass
+
+        # 3. Fallback to default browser
+        webbrowser.open(url)
+
+    # Launch UI Window in background thread only when running as .exe
+    if getattr(sys, 'frozen', False):
+        threading.Thread(target=start_app_window, daemon=True).start()
+    
+    # Run FastAPI server
+    uvicorn.run(app, host="127.0.0.1", port=5009)

@@ -1,4 +1,5 @@
 import logging
+import os
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -6,15 +7,21 @@ from database.config import LocalSessionLocal
 from models import SyncConfig
 from services.sync_service import SyncService
 from sqlalchemy.orm import sessionmaker
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 # Initialize scheduler
 scheduler = BackgroundScheduler()
 
-def sync_job():
-    """Job that runs periodically to sync data."""
-    logger.info("Scheduler triggered sync job.")
+def sync_connection_job(connection_name: str):
+    """Job that runs periodically for a specific connection."""
+    print(f"\n=======================================================", flush=True)
+    print(f"[SCHEDULER] Auto-Sync Triggered for: '{connection_name}'", flush=True)
+    print(f"=======================================================", flush=True)
+    logger.info(f"Scheduler triggered sync job for connection: {connection_name}")
     local_db = LocalSessionLocal()
     db = None
     try:
@@ -24,37 +31,55 @@ def sync_job():
             SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
             db = SessionLocal()
         except Exception as e:
-            logger.error(f"Failed to get MySQL connection in scheduler: {e}")
-            return
-            
-        # Get active configs
-        configs = db.query(SyncConfig).all()
-        if not configs:
-            logger.warning("No Tally configuration found. Skipping sync.")
+            err_msg = f"Failed to get MySQL connection: {e}"
+            print(f"[SCHEDULER] [FAILED] '{connection_name}': {err_msg}", flush=True)
+            logger.error(f"Failed to get MySQL connection in scheduler for {connection_name}: {e}")
             return
 
-        for config in configs:
-            try:
-                logger.info(f"Running sync for connection: {config.connection_name}")
-                host = config.tally_host
-                port = config.tally_port
-                
-                service = SyncService(db, host, port)
-                service.run_sync(connection_name=config.connection_name)
-            except Exception as e:
-                logger.error(f"Error in sync job for {config.connection_name}: {e}")
+        config = db.query(SyncConfig).filter(SyncConfig.connection_name == connection_name).first()
+        if not config:
+            print(f"[SCHEDULER] [WARNING] Connection '{connection_name}' not found. Skipping.", flush=True)
+            logger.warning(f"Connection '{connection_name}' not found. Skipping sync.")
+            return
+
+        # Double check if still active
+        timing = (config.scheduler_timing or "").strip().lower()
+        if not timing or timing in ["inactive", "off", "0", "none"]:
+            print(f"[SCHEDULER] [INFO] '{connection_name}' is inactive. Skipping.", flush=True)
+            logger.info(f"Scheduler for '{connection_name}' is inactive. Skipping.")
+            return
+
+        host = config.tally_host
+        port = config.tally_port
+        
+        print(f"[SCHEDULER] [RUNNING] Syncing '{connection_name}' ({host}:{port}) ...", flush=True)
+        service = SyncService(db, host, port)
+        service.run_sync(connection_name=config.connection_name)
+        
+        # Check latest log status
+        from models import SyncLog
+        latest_log = db.query(SyncLog).filter(SyncLog.connection_name == connection_name).order_by(SyncLog.timestamp.desc()).first()
+        if latest_log and latest_log.status == "SUCCESS":
+            print(f"[SCHEDULER] [SUCCESS] Auto-Sync completed for '{connection_name}' | Records: {latest_log.records_fetched}", flush=True)
+        elif latest_log and latest_log.status == "ERROR":
+            print(f"[SCHEDULER] [ERROR] '{connection_name}': {latest_log.message}", flush=True)
+        else:
+            print(f"[SCHEDULER] [COMPLETED] Auto-Sync finished for '{connection_name}'", flush=True)
+    except Exception as e:
+        print(f"[SCHEDULER] [EXCEPTION] Error in sync for '{connection_name}': {e}", flush=True)
+        logger.error(f"Error in sync job for connection '{connection_name}': {e}")
     finally:
+        print(f"=======================================================\n", flush=True)
         if db:
             db.close()
         local_db.close()
 
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
+def sync_job():
+    """Fallback legacy sync job for all configs."""
+    update_scheduler_job()
 
 def update_scheduler_job():
-    """Update or add the sync job based on database configuration and .env timing."""
+    """Update or add sync jobs connection-wise based on database configuration."""
     local_db = LocalSessionLocal()
     db = None
     try:
@@ -67,36 +92,72 @@ def update_scheduler_job():
             logger.error(f"Failed to connect to MySQL to check scheduler config: {e}")
             return
             
-        config = db.query(SyncConfig).first()
-        timing_env = os.getenv("SCHEDULER_TIMING", "")
-        
-        if not config or not timing_env:
-            if scheduler.get_job('tally_sync_job'):
+        configs = db.query(SyncConfig).all()
+        active_connection_names = {c.connection_name for c in configs}
+
+        # Remove old global legacy job if exists
+        if scheduler.get_job('tally_sync_job'):
+            try:
                 scheduler.remove_job('tally_sync_job')
-                logger.info("Removed sync job because no config or timing was found.")
-            return
+            except Exception:
+                pass
 
-        timing = timing_env.strip().lower()
-        
-        if ' ' in timing:
-            trigger = CronTrigger.from_crontab(timing)
-            logger.info(f"Scheduling job with cron: {timing}")
-        elif timing == 'daily':
-            trigger = CronTrigger(hour=0, minute=0)
-            logger.info("Scheduling job daily at midnight.")
-        elif timing == 'hourly':
-            trigger = CronTrigger(minute=0)
-            logger.info("Scheduling job hourly.")
-        elif timing.isdigit():
-            trigger = IntervalTrigger(minutes=int(timing))
-            logger.info(f"Scheduling job with interval: {timing} minutes.")
-        else:
-            trigger = IntervalTrigger(minutes=5)
-            logger.warning(f"Unknown scheduling format '{timing}', defaulting to 5 minutes.")
+        # Remove jobs for connections that no longer exist
+        for job in scheduler.get_jobs():
+            if job.id.startswith('sync_conn_'):
+                conn_name = job.id.replace('sync_conn_', '')
+                if conn_name not in active_connection_names:
+                    try:
+                        scheduler.remove_job(job.id)
+                        logger.info(f"Removed scheduler job for removed connection: {conn_name}")
+                    except Exception:
+                        pass
 
-        scheduler.add_job(sync_job, trigger=trigger, id='tally_sync_job', replace_existing=True)
+        # Schedule or remove jobs per connection
+        for config in configs:
+            job_id = f"sync_conn_{config.connection_name}"
+            timing = (config.scheduler_timing or "").strip().lower()
+            
+            # Check if active
+            if not timing or timing in ["inactive", "off", "0", "none"]:
+                if scheduler.get_job(job_id):
+                    try:
+                        scheduler.remove_job(job_id)
+                        logger.info(f"Scheduler disabled for connection: {config.connection_name}")
+                    except Exception:
+                        pass
+                continue
+
+            # Determine trigger
+            if ' ' in timing:
+                trigger = CronTrigger.from_crontab(timing)
+                logger.info(f"Scheduling connection '{config.connection_name}' with cron: {timing}")
+            elif timing == 'daily':
+                trigger = CronTrigger(hour=0, minute=0)
+                logger.info(f"Scheduling connection '{config.connection_name}' daily at midnight.")
+            elif timing == 'hourly':
+                trigger = CronTrigger(minute=0)
+                logger.info(f"Scheduling connection '{config.connection_name}' hourly.")
+            elif timing.isdigit():
+                minutes = int(timing)
+                if minutes <= 0:
+                    minutes = 5
+                trigger = IntervalTrigger(minutes=minutes)
+                logger.info(f"Scheduling connection '{config.connection_name}' with interval: {minutes} minutes.")
+            else:
+                trigger = IntervalTrigger(minutes=5)
+                logger.warning(f"Unknown scheduling format '{timing}' for '{config.connection_name}', defaulting to 5 minutes.")
+
+            scheduler.add_job(
+                sync_connection_job,
+                trigger=trigger,
+                id=job_id,
+                args=[config.connection_name],
+                replace_existing=True
+            )
+            logger.info(f"Registered scheduler job '{job_id}' for connection: {config.connection_name}")
     except Exception as e:
-        logger.error(f"Error updating scheduler job: {e}")
+        logger.error(f"Error updating connection scheduler jobs: {e}")
     finally:
         if db:
             db.close()
@@ -104,10 +165,13 @@ def update_scheduler_job():
 
 def start_scheduler():
     """Start the background scheduler."""
-    scheduler.start()
+    if not scheduler.running:
+        scheduler.start()
     update_scheduler_job()
     logger.info("APScheduler started.")
 
 def stop_scheduler():
     """Stop the scheduler."""
-    scheduler.shutdown()
+    if scheduler.running:
+        scheduler.shutdown()
+
