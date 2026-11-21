@@ -1,7 +1,13 @@
-venv
-env
+venv/
+env/
 .env
-__pycache__
+__pycache__/
+*.py[cod]
 /lib
 *.zip
-data/*.db
+data/*.db
+
+# PyInstaller / Build artifacts
+build/
+dist/
+*.spec
