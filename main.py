@@ -1,4 +1,5 @@
 import logging
+import json
 import uvicorn
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -99,6 +100,9 @@ class ConfigSchema(BaseModel):
     scheduler_timing: Optional[str] = None
     file_format: Optional[str] = None
     request_xml: Optional[str] = None
+    unique_key_field: Optional[str] = None
+    dynamic_filters: Optional[dict] = None
+    database_name: Optional[str] = None
 
 class TestConfigSchema(BaseModel):
     connection_name: Optional[str] = None
@@ -109,6 +113,9 @@ class TestConfigSchema(BaseModel):
     scheduler_timing: Optional[str] = None
     file_format: Optional[str] = None
     request_xml: Optional[str] = None
+    unique_key_field: Optional[str] = None
+    dynamic_filters: Optional[dict] = None
+    database_name: Optional[str] = None
 
 class MysqlConfigSchema(BaseModel):
     host: str
@@ -138,21 +145,48 @@ def get_tables(db: Session = Depends(get_db)):
     return {"tables": inspector.get_table_names(), "schema": schema, "url": str(engine.url).replace(engine.url.password, '***') if engine.url.password else str(engine.url)}
 
 @app.get("/api/config", response_model=List[ConfigSchema])
-def get_config(db: Session = Depends(get_db)):
-    configs = db.query(SyncConfig).all()
-    result = []
-    for config in configs:
-        result.append({
-            "connection_name": config.connection_name,
-            "tally_host": config.tally_host, 
-            "tally_port": config.tally_port,
-            "company_name": config.company_name or "",
-            "report_name": config.report_name or "",
-            "scheduler_timing": config.scheduler_timing or "",
-            "file_format": config.file_format or "XML",
-            "request_xml": config.request_xml or ""
-        })
-    return result
+def get_config(local_db: Session = Depends(get_local_db)):
+    # MysqlConfig is always in SQLite
+    mysql_config = local_db.query(MysqlConfig).first()
+    if not mysql_config:
+        return []  # MySQL not configured yet — return empty list gracefully
+
+    # SyncConfig is in MySQL
+    try:
+        engine = get_mysql_engine(local_db)
+        SessionMySQL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        mysql_db = SessionMySQL()
+        try:
+            configs = mysql_db.query(SyncConfig).all()
+            result = []
+            for config in configs:
+                db_name = mysql_config.database_name if mysql_config else ""
+                if not db_name and config.company_name:
+                    import re
+                    # Same logic as frontend generateDbName
+                    db_name = re.sub(r'[^a-z0-9]', '_', config.company_name.lower())
+                    db_name = re.sub(r'_+', '_', db_name).strip('_')
+
+                result.append({
+                    "connection_name": config.connection_name,
+                    "tally_host": config.tally_host,
+                    "tally_port": config.tally_port,
+                    "company_name": config.company_name or "",
+                    "report_name": config.report_name or "",
+                    "scheduler_timing": config.scheduler_timing or "",
+                    "file_format": config.file_format or "XML",
+                    "request_xml": config.request_xml or "",
+                    "unique_key_field": config.unique_key_field or "",
+                    "dynamic_filters": json.loads(config.dynamic_filters) if config.dynamic_filters else {},
+                    "database_name": db_name
+                })
+            return result
+        finally:
+            mysql_db.close()
+    except Exception as e:
+        logger.error(f"Failed to fetch config from MySQL: {e}")
+        return []
+
 
 @app.post("/api/config")
 def update_config(config_data: ConfigSchema, db: Session = Depends(get_db)):
@@ -168,8 +202,12 @@ def update_config(config_data: ConfigSchema, db: Session = Depends(get_db)):
     config.company_name = config_data.company_name
     config.report_name = config_data.report_name
     config.scheduler_timing = config_data.scheduler_timing
+    import json
     config.file_format = config_data.file_format
     config.request_xml = config_data.request_xml
+    config.unique_key_field = config_data.unique_key_field
+    if config_data.dynamic_filters:
+        config.dynamic_filters = json.dumps(config_data.dynamic_filters)
     db.add(config)
     db.commit()
     update_scheduler_job()
@@ -184,10 +222,19 @@ def modify_config(connection_name: str, config_data: ConfigSchema, db: Session =
     config.tally_host = config_data.tally_host
     config.tally_port = config_data.tally_port
     config.company_name = config_data.company_name
+    
+    # If the user changed the report name, reset last_alter_id to 0
+    if config.report_name != config_data.report_name:
+        config.last_alter_id = 0
+        
     config.report_name = config_data.report_name
+    import json
     config.scheduler_timing = config_data.scheduler_timing
     config.file_format = config_data.file_format
     config.request_xml = config_data.request_xml
+    config.unique_key_field = config_data.unique_key_field
+    if config_data.dynamic_filters is not None:
+        config.dynamic_filters = json.dumps(config_data.dynamic_filters)
     db.commit()
     update_scheduler_job()
     return {"message": "Configuration updated successfully"}
@@ -213,68 +260,83 @@ def get_logs(skip: int = 0, limit: int = 10, connection_name: Optional[str] = No
     return {"total": total, "logs": logs}
 
 @app.post("/api/sync/test")
-def test_sync(test_data: Optional[TestConfigSchema] = None, db: Session = Depends(get_db)):
+def test_sync(test_data: Optional[TestConfigSchema] = None, local_db: Session = Depends(get_local_db)):
     """Manually trigger a sync for testing."""
+    from services.tally_service import TallyService
+
     if test_data and test_data.tally_host and test_data.tally_port:
         host = test_data.tally_host
         port = test_data.tally_port
     else:
-        config = db.query(SyncConfig).first()
-        if not config:
-            raise HTTPException(status_code=400, detail="Configuration not set")
-        host = config.tally_host
-        port = config.tally_port
-    
-    # Run sync synchronously for testing feedback
-    service = SyncService(db, host, port)
+        raise HTTPException(status_code=400, detail="Tally host and port are required")
+
+    # Try to get MySQL engine (optional — only needed if saving data)
+    mysql_db = None
+    try:
+        engine = get_mysql_engine(local_db)
+        SessionMySQL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        mysql_db = SessionMySQL()
+    except Exception:
+        mysql_db = None  # MySQL not configured yet — okay for XML preview
+
+    # TallyService does NOT need DB — use it directly
+    tally_service = TallyService(host, port)
+
     try:
         if test_data and test_data.request_xml:
-            # Send custom XML from UI
-            response_text = service.tally_service._send_request(test_data.request_xml)
-            
-            # Also test the dynamic DB engine insertion
-            config = db.query(SyncConfig).first()
-            report_name = config.report_name if config and config.report_name else "Manual_Test_Report"
-            
-            parsed_data, entity_name = service.tally_service.parse_xml_to_dict(response_text)
+            # Send custom XML to Tally
+            response_text = tally_service._send_request(test_data.request_xml)
+            parsed_data, entity_name = tally_service.parse_xml_to_dict(response_text)
             records_count = len(parsed_data)
-            
-            if records_count > 0 and entity_name:
-                service.db_engine.sync_data(report_name, entity_name, parsed_data)
+
+            if records_count > 0 and entity_name and mysql_db:
+                # Save to MySQL only if configured
+                service = SyncService(mysql_db, host, port)
+                config = mysql_db.query(SyncConfig).first()
+                report_name = config.report_name if config and config.report_name else "Manual_Test_Report"
+                unique_key = test_data.unique_key_field if test_data and test_data.unique_key_field else (config.unique_key_field if config else None)
+                service.db_engine.sync_data(report_name, entity_name, parsed_data, unique_key_field=unique_key)
                 msg = f"Connection successful. {records_count} records saved to database table."
+            elif records_count > 0:
+                msg = f"Connection successful. {records_count} records found. (Configure MySQL to save data)"
             else:
                 msg = "Connection successful, but no records found to save."
-                
-            # Log success
-            log_entry = SyncLog(
-                connection_name=test_data.connection_name if test_data else None,
-                status="SUCCESS", 
-                message=msg, 
-                records_fetched=records_count,
-                request_payload=test_data.request_xml[:50000] if test_data and test_data.request_xml else None,
-                response_payload=response_text[:50000] if response_text else None
-            )
-            db.add(log_entry)
-            db.commit()
-            
+
+            # Log (only if MySQL available)
+            if mysql_db:
+                log_entry = SyncLog(
+                    connection_name=test_data.connection_name if test_data else None,
+                    status="SUCCESS",
+                    message=msg,
+                    records_fetched=records_count,
+                    request_payload=test_data.request_xml[:50000] if test_data and test_data.request_xml else None,
+                    response_payload=response_text[:50000] if response_text else None
+                )
+                mysql_db.add(log_entry)
+                mysql_db.commit()
+
             return {"status": "SUCCESS", "message": msg, "response_xml": response_text}
         else:
-            # Default check connection
-            service.tally_service.get_ledgers()
+            # Just test Tally connectivity
+            tally_service.get_ledgers()
             return {"status": "SUCCESS", "message": "Connection to Tally successful."}
     except Exception as e:
-        request_payload = test_data.request_xml if test_data else None
-        log_entry = SyncLog(
-            connection_name=test_data.connection_name if test_data else None,
-            status="ERROR", 
-            message=str(e), 
-            records_fetched=0,
-            request_payload=request_payload[:50000] if request_payload else None,
-            response_payload=None
-        )
-        db.add(log_entry)
-        db.commit()
+        if mysql_db:
+            log_entry = SyncLog(
+                connection_name=test_data.connection_name if test_data else None,
+                status="ERROR",
+                message=str(e),
+                records_fetched=0,
+                request_payload=(test_data.request_xml[:50000] if test_data and test_data.request_xml else None),
+                response_payload=None
+            )
+            mysql_db.add(log_entry)
+            mysql_db.commit()
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        if mysql_db:
+            mysql_db.close()
+
 
 @app.post("/api/sync/start")
 def start_sync(background_tasks: BackgroundTasks, test_data: Optional[TestConfigSchema] = None, db: Session = Depends(get_db)):
@@ -304,18 +366,19 @@ def start_sync(background_tasks: BackgroundTasks, test_data: Optional[TestConfig
     log_id = log_entry.id
 
     # Fire background task
-    def background_sync_task(log_id, host, port, connection_name):
+    def background_sync_task(log_id, host, port, connection_name, test_data_dict):
         # We need a new DB session for the background task
         engine = get_mysql_engine(next(get_local_db()))
         SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
         bg_db = SessionLocal()
         try:
             service = SyncService(bg_db, host, port)
-            service.run_sync(connection_name=connection_name, log_id=log_id)
+            service.run_sync(connection_name=connection_name, log_id=log_id, test_data_dict=test_data_dict)
         finally:
             bg_db.close()
 
-    background_tasks.add_task(background_sync_task, log_id, host, port, connection_name)
+    test_data_dict = test_data.dict() if test_data else None
+    background_tasks.add_task(background_sync_task, log_id, host, port, connection_name, test_data_dict)
     
     return {"status": "SUCCESS", "message": "Sync started.", "log_id": log_id}
 
@@ -400,3 +463,10 @@ def validate_mysql_config(config_data: MysqlConfigSchema):
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+#     VCHLEVEL --- 3125 
+# VCHINV --- 130252 
+# VCHLED --- 11434  
+# VCHBILLALLO --- 4913  
+# VCHCC ---  5  
+# VCHINOUT ---39,515

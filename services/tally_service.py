@@ -36,56 +36,67 @@ class TallyService:
 
     def parse_xml_iteratively(self, response):
         """
-        Parses Tally XML response dynamically as a stream using iterparse.
-        Yields parsed dictionary objects one by one instead of loading all in memory.
+        Parses Tally XML response as a stream using iterparse.
+        Cleans invalid Tally characters/tags per chunk safely,
+        handling chunk boundaries so <> or </> are never split.
         """
         import xml.etree.ElementTree as ET
-        
-        # We need a wrapper to clean the stream text on the fly
-        # Since Tally returns invalid XML chars, we'll read raw chunks, clean them, and yield to iterparse.
+        import re
+
         def clean_xml_stream(resp):
-            import re
-            def valid_xml_char(match):
+            def valid_entity(match):
                 text = match.group(0)
                 try:
-                    if text.lower().startswith('&#x'):
-                        val = int(text[3:-1], 16)
-                    else:
-                        val = int(text[2:-1])
-                    if val == 0x9 or val == 0xA or val == 0xD or (0x20 <= val <= 0xD7FF) or (0xE000 <= val <= 0xFFFD) or (0x10000 <= val <= 0x10FFFF):
+                    val = int(text[3:-1], 16) if text.lower().startswith('&#x') else int(text[2:-1])
+                    if (val == 0x9 or val == 0xA or val == 0xD or
+                            (0x20 <= val <= 0xD7FF) or
+                            (0xE000 <= val <= 0xFFFD) or
+                            (0x10000 <= val <= 0x10FFFF)):
                         return text
-                    return ""
-                except:
-                    return ""
-                    
-            buffer = ""
+                    return ''
+                except Exception:
+                    return ''
+
+            leftover = ''
             for chunk in resp.iter_content(chunk_size=1024 * 64, decode_unicode=True):
-                if chunk:
-                    buffer += chunk
-                    # To prevent splitting an XML entity like &#x1F; across chunks,
-                    # we check if there's an '&' near the end of the buffer.
-                    last_amp = buffer.rfind('&')
-                    if last_amp != -1 and len(buffer) - last_amp < 10:
-                        to_process = buffer[:last_amp]
-                        buffer = buffer[last_amp:]
-                    else:
-                        to_process = buffer
-                        buffer = ""
-                        
-                    if to_process:
-                        # Clean raw invalid characters
-                        clean_chunk = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f]', '', to_process)
-                        # Clean invalid entities dynamically
-                        clean_chunk = re.sub(r'&#[xX]?[0-9a-fA-F]+;', valid_xml_char, clean_chunk)
-                        yield clean_chunk.encode('utf-8')
-                        
-            if buffer:
-                clean_chunk = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f]', '', buffer)
-                clean_chunk = re.sub(r'&#[xX]?[0-9a-fA-F]+;', valid_xml_char, clean_chunk)
-                yield clean_chunk.encode('utf-8')
+                if not chunk:
+                    continue
+
+                to_process = leftover + chunk
+
+                # Hold back up to 10 chars at the end in case a tag/entity is split
+                # across this chunk and the next (e.g. chunk ends with '<' or '&')
+                safe_end = len(to_process)
+                for tail in range(1, 11):
+                    c = to_process[safe_end - tail]
+                    if c in ('<', '&'):
+                        safe_end = safe_end - tail
+                        break
+
+                leftover = to_process[safe_end:]
+                to_process = to_process[:safe_end]
+
+                if not to_process:
+                    continue
+
+                # Remove raw control characters (keep tab/CR/LF)
+                cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f]', '', to_process)
+                # Remove invalid XML numeric character references
+                cleaned = re.sub(r'&#[xX]?[0-9a-fA-F]+;', valid_entity, cleaned)
+                # Remove empty tags <> and </> that Tally produces for empty fields
+                cleaned = re.sub(r'<\s*/?\s*>', '', cleaned)
+
+                yield cleaned.encode('utf-8')
+
+            # Flush any leftover
+            if leftover:
+                cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f]', '', leftover)
+                cleaned = re.sub(r'&#[xX]?[0-9a-fA-F]+;', valid_entity, cleaned)
+                cleaned = re.sub(r'<\s*/?\s*>', '', cleaned)
+                if cleaned.strip():
+                    yield cleaned.encode('utf-8')
 
         def element_to_dict(elem):
-            """Recursively converts an XML element to a dict."""
             result = {}
             for child in elem:
                 if len(child) == 0:
@@ -104,100 +115,79 @@ class TallyService:
             def __init__(self, iterator):
                 self.iterator = iterator
                 self.buffer = b''
+
             def read(self, size=-1):
                 if size == -1:
-                    chunks = [self.buffer]
-                    for chunk in self.iterator:
-                        chunks.append(chunk)
+                    data = [self.buffer] + list(self.iterator)
                     self.buffer = b''
-                    return b''.join(chunks)
-                
+                    return b''.join(data)
                 while len(self.buffer) < size:
                     try:
-                        chunk = next(self.iterator)
-                        self.buffer += chunk
+                        self.buffer += next(self.iterator)
                     except StopIteration:
                         break
-                
                 result = self.buffer[:size]
                 self.buffer = self.buffer[size:]
                 return result
 
-        cleaned_stream = FileLikeIter(clean_xml_stream(response))
-        
-        # Start iterparse
+        stream = FileLikeIter(clean_xml_stream(response))
+
         depth = 0
         current_record = {}
         current_base_entity = None
-        
+        skip_tags = {'HEADER', 'DESC', 'STATICVARIABLES', 'IMPORTDATA', 'EXPORTDATA', 'BODY'}
+
         try:
-            # We use iterparse to yield 'start' and 'end' events
-            context = ET.iterparse(cleaned_stream, events=("start", "end"))
-            
+            context = ET.iterparse(stream, events=("start", "end"))
             for event, elem in context:
                 if event == "start":
                     depth += 1
-                
                 elif event == "end":
                     depth -= 1
-                    
-                    # Capture any element directly under the root (depth == 1)
-                    if depth == 1 and elem.tag not in ('HEADER', 'DESC', 'STATICVARIABLES', 'IMPORTDATA', 'EXPORTDATA'):
-                        import re
-                        # Strip numbers from tag to get base entity name (VCHINV1 -> VCHINV)
+                    if depth == 1 and elem.tag not in skip_tags:
                         base_entity = re.sub(r'\d+$', '', elem.tag)
-                        
-                        # Process the element
                         item_data = {}
-                        
-                        # Extract attributes of the item itself
+
                         if hasattr(elem, 'attrib') and elem.attrib:
                             for k, v in elem.attrib.items():
                                 item_data[f"ATTR_{k}"] = v
 
-                        # We know that children might have complex structures
                         if len(elem) == 0:
-                            # Flat text node like <VCHINV1>value</VCHINV1>
                             item_data[elem.tag] = elem.text if elem.text else ""
                         else:
                             for child in list(elem):
                                 if len(child) == 0:
                                     item_data[child.tag] = child.text if child.text else ""
                                 else:
-                                    nested_data = element_to_dict(child)
                                     import json
-                                    item_data[child.tag] = json.dumps(nested_data)
-                        
+                                    item_data[child.tag] = json.dumps(element_to_dict(child))
+
                         if item_data:
-                            # Check if we need to flush the current record buffer
-                            # We flush if the base_entity changes, OR if any key in item_data already exists in current_record
                             should_flush = False
                             if current_base_entity is not None and base_entity != current_base_entity:
                                 should_flush = True
                             else:
-                                for k in item_data.keys():
+                                for k in item_data:
                                     if k in current_record:
                                         should_flush = True
                                         break
-                            
+
                             if should_flush and current_record:
                                 yield current_record, current_base_entity
                                 current_record = {}
-                            
-                            # Merge item_data into current_record
+
                             current_record.update(item_data)
                             current_base_entity = base_entity
-                            
-                        # Memory cleanup: remove the element from its parent to free memory
+
                         elem.clear()
-                        
-            # Yield any remaining record in buffer
+
             if current_record and current_base_entity:
                 yield current_record, current_base_entity
-                
+
         except ET.ParseError as e:
-            logger.error(f"Streaming XML Parsing Error: {e}")
-            raise Exception(f"Failed to parse XML from Tally. Invalid character or malformed XML: {e}")
+            logger.error(f"XML ParseError: {e}")
+            raise Exception(f"Failed to parse XML from Tally: {e}")
+
 
 
     def get_ledgers(self):
