@@ -361,7 +361,8 @@ def test_sync(test_data: Optional[TestConfigSchema] = None, local_db: Session = 
         host = test_data.tally_host
         port = test_data.tally_port
     else:
-        raise HTTPException(status_code=400, detail="Tally host and port are required")
+        host = "127.0.0.1"
+        port = 9000
 
     # Try to get MySQL engine (optional — only needed if saving data)
     mysql_db = None
