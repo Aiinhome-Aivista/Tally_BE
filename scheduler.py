@@ -25,21 +25,28 @@ def sync_connection_job(connection_name: str):
     local_db = LocalSessionLocal()
     db = None
     try:
-        try:
-            from main import get_mysql_engine
-            engine = get_mysql_engine(local_db)
-            SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-            db = SessionLocal()
-        except Exception as e:
-            err_msg = f"Failed to get MySQL connection: {e}"
-            print(f"[SCHEDULER] [FAILED] '{connection_name}': {err_msg}", flush=True)
-            logger.error(f"Failed to get MySQL connection in scheduler for {connection_name}: {e}")
-            return
-
-        config = db.query(SyncConfig).filter(SyncConfig.connection_name == connection_name).first()
+        config = local_db.query(SyncConfig).filter(SyncConfig.connection_name == connection_name).first()
         if not config:
             print(f"[SCHEDULER] [WARNING] Connection '{connection_name}' not found. Skipping.", flush=True)
             logger.warning(f"Connection '{connection_name}' not found. Skipping sync.")
+            return
+
+        # Double check if still active
+        timing = (config.scheduler_timing or "").strip().lower()
+        if not timing or timing in ["inactive", "off", "0", "none"]:
+            print(f"[SCHEDULER] [INFO] '{connection_name}' is inactive. Skipping.", flush=True)
+            logger.info(f"Scheduler for '{connection_name}' is inactive. Skipping.")
+            return
+
+        try:
+            from main import get_engine_for_config
+            engine = get_engine_for_config(config, local_db)
+            SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+            db = SessionLocal()
+        except Exception as e:
+            err_msg = f"Failed to get target database connection: {e}"
+            print(f"[SCHEDULER] [FAILED] '{connection_name}': {err_msg}", flush=True)
+            logger.error(f"Failed to get target database connection in scheduler for {connection_name}: {e}")
             return
 
         # Double check if still active
@@ -81,18 +88,8 @@ def sync_job():
 def update_scheduler_job():
     """Update or add sync jobs connection-wise based on database configuration."""
     local_db = LocalSessionLocal()
-    db = None
     try:
-        try:
-            from main import get_mysql_engine
-            engine = get_mysql_engine(local_db)
-            SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-            db = SessionLocal()
-        except Exception as e:
-            logger.error(f"Failed to connect to MySQL to check scheduler config: {e}")
-            return
-            
-        configs = db.query(SyncConfig).all()
+        configs = local_db.query(SyncConfig).all()
         active_connection_names = {c.connection_name for c in configs}
 
         # Remove old global legacy job if exists
@@ -159,8 +156,6 @@ def update_scheduler_job():
     except Exception as e:
         logger.error(f"Error updating connection scheduler jobs: {e}")
     finally:
-        if db:
-            db.close()
         local_db.close()
 
 def start_scheduler():

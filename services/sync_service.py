@@ -28,14 +28,17 @@ class SyncService:
             self.db.refresh(log_entry)
             log_id = log_entry.id
             
+        local_db = None
         try:
             logger.info(f"Starting Tally synchronization for log_id: {log_id}...")
             
-            # Fetch config to get request_xml and report_name
+            # Fetch config from local SQLite
+            from database.config import LocalSessionLocal
+            local_db = LocalSessionLocal()
             if connection_name:
-                config = self.db.query(SyncConfig).filter(SyncConfig.connection_name == connection_name).first()
+                config = local_db.query(SyncConfig).filter(SyncConfig.connection_name == connection_name).first()
             else:
-                config = self.db.query(SyncConfig).first()
+                config = local_db.query(SyncConfig).first()
                 
             if not config:
                 raise Exception("No sync configuration found. Please validate connection in the UI.")
@@ -163,10 +166,19 @@ class SyncService:
                 total_records += len(batch)
                 logger.info(f"[{ename}] Final batch of {len(batch)} records. Total: {total_records}")
                 
-            # Update last alter id in config
+            # Update last alter id in local SQLite config
             if max_alter_id > (config.last_alter_id or 0):
                 config.last_alter_id = max_alter_id
+                local_db.commit()
                 logger.info(f"Updated last_alter_id to {max_alter_id}")
+                try:
+                    from models import RemoteSyncConfig
+                    remote_cfg = self.db.query(RemoteSyncConfig).filter(RemoteSyncConfig.connection_name == config.connection_name).first()
+                    if remote_cfg:
+                        remote_cfg.last_alter_id = max_alter_id
+                        self.db.commit()
+                except Exception as e:
+                    logger.debug(f"Could not mirror last_alter_id to remote sync_config: {e}")
             
             # Log success
             log_entry = self.db.query(SyncLog).filter(SyncLog.id == log_id).first()
@@ -207,3 +219,6 @@ class SyncService:
                 log_entry.status = "ERROR"
                 log_entry.message = str(e)
                 self.db.commit()
+        finally:
+            if local_db:
+                local_db.close()

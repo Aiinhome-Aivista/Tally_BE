@@ -3,7 +3,7 @@ from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.sql import func
 from database.config import Base, LocalBase
 
-class SyncConfig(Base):
+class SyncConfig(LocalBase):
     __tablename__ = "sync_config"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -22,6 +22,29 @@ class SyncConfig(Base):
     dynamic_filters = Column(Text, nullable=True)
     database_name = Column(String(255), nullable=True)
     db_type = Column(String(50), default="mysql", nullable=True)
+    db_host = Column(String(255), nullable=True)
+    db_port = Column(Integer, nullable=True)
+    db_username = Column(String(255), nullable=True)
+    db_password = Column(String(255), nullable=True)
+
+class RemoteSyncConfig(Base):
+    __tablename__ = "sync_config"
+
+    id = Column(Integer, primary_key=True, index=True)
+    connection_name = Column(String(255), unique=True, index=True, nullable=False)
+    tally_host = Column(String(255), nullable=False)
+    tally_port = Column(Integer, nullable=False)
+    company_name = Column(String(255), nullable=True)
+    report_name = Column(String(255), nullable=True)
+    request_xml = Column(Text, nullable=True)
+    scheduler_timing = Column(String(50), nullable=True)
+    file_format = Column(String(10), default="XML")
+    last_sync_time = Column(DateTime(timezone=True), default=None)
+    status = Column(String(50), default="IDLE") # IDLE, SYNCING, ERROR
+    last_alter_id = Column(Integer, default=0)
+    unique_key_field = Column(String(100), nullable=True)
+    dynamic_filters = Column(Text, nullable=True)
+    database_name = Column(String(255), nullable=True)
 
 class SyncLog(Base):
     __tablename__ = "sync_logs"

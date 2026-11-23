@@ -26,7 +26,7 @@ from database.config import Base, LocalBase, get_local_db, sqlite_engine
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 import urllib.parse
-from models import SyncConfig, SyncLog, MysqlConfig
+from models import SyncConfig, SyncLog, MysqlConfig, RemoteSyncConfig
 from scheduler import start_scheduler, stop_scheduler, sync_job, update_scheduler_job
 from services.sync_service import SyncService
 
@@ -128,6 +128,112 @@ def get_db(local_db: Session = Depends(get_local_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+def get_engine_for_config(config, local_db: Session = None):
+    """Returns engine for a specific SyncConfig based on its stored database credentials, or falls back to global."""
+    from sqlalchemy import create_engine as sa_create_engine
+    if config and config.db_host and config.database_name:
+        db_url = build_engine_url(
+            config.db_type,
+            config.db_host,
+            config.db_port,
+            config.db_username,
+            config.db_password,
+            config.database_name
+        )
+        return sa_create_engine(db_url, pool_pre_ping=True)
+    
+    if local_db:
+        return get_mysql_engine(local_db)
+    
+    db = next(get_local_db())
+    try:
+        return get_mysql_engine(db)
+    finally:
+        db.close()
+
+def sync_existing_connections_to_local_sqlite(local_db: Session):
+    """
+    Recovers and mirrors any existing connections from MySQL and SQL Server into local SQLite sync_config,
+    ensuring all connections (MySQL + MSSQL) appear together in the central table.
+    """
+    from sqlalchemy import create_engine as sa_create_engine
+    try:
+        # 1. Try recovering from MySQL (default localhost:3306, root, company1)
+        try:
+            mysql_url = "mysql+pymysql://root:@localhost:3306/company1"
+            mysql_eng = sa_create_engine(mysql_url)
+            with mysql_eng.connect() as conn:
+                from sqlalchemy import inspect
+                insp = inspect(mysql_eng)
+                if "sync_config" in insp.get_table_names():
+                    rows = conn.execute(text("SELECT connection_name, tally_host, tally_port, company_name, report_name, request_xml, scheduler_timing, file_format, last_alter_id, unique_key_field, dynamic_filters, database_name FROM sync_config")).fetchall()
+                    for r in rows:
+                        c_name = r[0]
+                        if c_name and not local_db.query(SyncConfig).filter(SyncConfig.connection_name == c_name).first():
+                            new_cfg = SyncConfig(
+                                connection_name=c_name,
+                                tally_host=r[1] or "localhost",
+                                tally_port=int(r[2] or 9000),
+                                company_name=r[3],
+                                report_name=r[4],
+                                request_xml=r[5],
+                                scheduler_timing=r[6],
+                                file_format=r[7] or "XML",
+                                last_alter_id=int(r[8] or 0),
+                                unique_key_field=r[9],
+                                dynamic_filters=r[10],
+                                database_name=r[11] or "company1",
+                                db_type="mysql",
+                                db_host="localhost",
+                                db_port=3306,
+                                db_username="root",
+                                db_password=""
+                            )
+                            local_db.add(new_cfg)
+                    local_db.commit()
+        except Exception as e:
+            logger.debug(f"MySQL recovery check: {e}")
+
+        # 2. Try recovering from SQL Server (SONIA\SQLEXPRESS or localhost, kidcity_solutions_pvt_ltd_25_26)
+        try:
+            mssql_cfg = local_db.query(MysqlConfig).filter(MysqlConfig.db_type == "sqlserver").first()
+            if mssql_cfg:
+                mssql_url = build_engine_url("sqlserver", mssql_cfg.host, mssql_cfg.port, mssql_cfg.username, mssql_cfg.password, mssql_cfg.database_name)
+                mssql_eng = sa_create_engine(mssql_url)
+                with mssql_eng.connect() as conn:
+                    from sqlalchemy import inspect
+                    insp = inspect(mssql_eng)
+                    if "sync_config" in insp.get_table_names():
+                        rows = conn.execute(text("SELECT connection_name, tally_host, tally_port, company_name, report_name, request_xml, scheduler_timing, file_format, last_alter_id, unique_key_field, dynamic_filters, database_name FROM sync_config")).fetchall()
+                        for r in rows:
+                            c_name = r[0]
+                            if c_name and not local_db.query(SyncConfig).filter(SyncConfig.connection_name == c_name).first():
+                                new_cfg = SyncConfig(
+                                    connection_name=c_name,
+                                    tally_host=r[1] or "localhost",
+                                    tally_port=int(r[2] or 9000),
+                                    company_name=r[3],
+                                    report_name=r[4],
+                                    request_xml=r[5],
+                                    scheduler_timing=r[6],
+                                    file_format=r[7] or "XML",
+                                    last_alter_id=int(r[8] or 0),
+                                    unique_key_field=r[9],
+                                    dynamic_filters=r[10],
+                                    database_name=r[11] or mssql_cfg.database_name,
+                                    db_type="sqlserver",
+                                    db_host=mssql_cfg.host,
+                                    db_port=mssql_cfg.port,
+                                    db_username=mssql_cfg.username,
+                                    db_password=mssql_cfg.password
+                                )
+                                local_db.add(new_cfg)
+                        local_db.commit()
+        except Exception as e:
+            logger.debug(f"SQL Server recovery check: {e}")
+    except Exception as e:
+        logger.warning(f"Error syncing existing connections: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Start the background scheduler
@@ -167,6 +273,11 @@ class ConfigSchema(BaseModel):
     unique_key_field: Optional[str] = None
     dynamic_filters: Optional[dict] = None
     database_name: Optional[str] = None
+    db_type: Optional[str] = "mysql"
+    db_host: Optional[str] = None
+    db_port: Optional[int] = None
+    db_username: Optional[str] = None
+    db_password: Optional[str] = None
     total_rows: Optional[int] = 0
 
 class TestConfigSchema(BaseModel):
@@ -212,77 +323,59 @@ def get_tables(db: Session = Depends(get_db)):
 
 @app.get("/api/config", response_model=List[ConfigSchema])
 def get_config(local_db: Session = Depends(get_local_db)):
-    # MysqlConfig is always in SQLite
-    mysql_config = local_db.query(MysqlConfig).first()
-    if not mysql_config:
-        return []  # MySQL not configured yet — return empty list gracefully
-
-    # SyncConfig is in MySQL
-    try:
-        engine = get_mysql_engine(local_db)
-        SessionMySQL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        mysql_db = SessionMySQL()
-        try:
-            from sqlalchemy import inspect
-            inspector = inspect(engine)
-            existing_tables = set(inspector.get_table_names())
-
-            configs = mysql_db.query(SyncConfig).order_by(SyncConfig.id.desc()).all()
-            result = []
-            for config in configs:
-                db_name = config.database_name or (mysql_config.database_name if mysql_config else "")
-
-                # Calculate total rows in the target table
-                table_name = ''.join(c for c in (config.report_name or "").lower() if c.isalnum() or c == '_')
-                total_rows = 0
-                if table_name and table_name in existing_tables:
-                    try:
-                        is_mssql = engine.dialect.name == "mssql"
-                        quoted_tbl = f"[{table_name}]" if is_mssql else f"`{table_name}`"
-                        row_count = mysql_db.execute(text(f"SELECT COUNT(*) FROM {quoted_tbl}")).scalar()
+    # Auto-recover/mirror existing connections from MySQL and SQL Server into local SQLite
+    sync_existing_connections_to_local_sqlite(local_db)
+    
+    configs = local_db.query(SyncConfig).order_by(SyncConfig.id.desc()).all()
+    result = []
+    for config in configs:
+        db_name = config.database_name or ""
+        total_rows = 0
+        table_name = ''.join(c for c in (config.report_name or "").lower() if c.isalnum() or c == '_')
+        if table_name:
+            try:
+                target_engine = get_engine_for_config(config, local_db)
+                from sqlalchemy import inspect
+                inspector = inspect(target_engine)
+                if table_name in inspector.get_table_names():
+                    is_mssql = target_engine.dialect.name == "mssql"
+                    quoted_tbl = f"[{table_name}]" if is_mssql else f"`{table_name}`"
+                    with target_engine.connect() as conn:
+                        row_count = conn.execute(text(f"SELECT COUNT(*) FROM {quoted_tbl}")).scalar()
                         total_rows = int(row_count) if row_count is not None else 0
-                    except Exception:
-                        total_rows = 0
+            except Exception:
+                total_rows = 0
 
-                # Fallback to max / latest positive records_fetched from logs if table count is 0
-                if total_rows == 0:
-                    last_valid_log = mysql_db.query(SyncLog).filter(
-                        SyncLog.connection_name == config.connection_name,
-                        SyncLog.records_fetched > 0
-                    ).order_by(SyncLog.timestamp.desc()).first()
-                    if last_valid_log:
-                        total_rows = last_valid_log.records_fetched or 0
-
-                result.append({
-                    "id": config.id,
-                    "connection_name": config.connection_name,
-                    "tally_host": config.tally_host,
-                    "tally_port": config.tally_port,
-                    "company_name": config.company_name or "",
-                    "report_name": config.report_name or "",
-                    "scheduler_timing": config.scheduler_timing or "",
-                    "file_format": config.file_format or "XML",
-                    "request_xml": config.request_xml or "",
-                    "unique_key_field": config.unique_key_field or "",
-                    "dynamic_filters": json.loads(config.dynamic_filters) if config.dynamic_filters else {},
-                    "database_name": db_name,
-                    "total_rows": total_rows
-                })
-            return result
-        finally:
-            mysql_db.close()
-    except Exception as e:
-        logger.error(f"Failed to fetch config from MySQL: {e}")
-        return []
+        result.append({
+            "id": config.id,
+            "connection_name": config.connection_name,
+            "tally_host": config.tally_host,
+            "tally_port": config.tally_port,
+            "company_name": config.company_name or "",
+            "report_name": config.report_name or "",
+            "scheduler_timing": config.scheduler_timing or "",
+            "file_format": config.file_format or "XML",
+            "request_xml": config.request_xml or "",
+            "unique_key_field": config.unique_key_field or "",
+            "dynamic_filters": json.loads(config.dynamic_filters) if config.dynamic_filters else {},
+            "database_name": db_name,
+            "db_type": config.db_type or "mysql",
+            "db_host": config.db_host,
+            "db_port": config.db_port,
+            "db_username": config.db_username,
+            "db_password": config.db_password,
+            "total_rows": total_rows
+        })
+    return result
 
 
 @app.post("/api/config")
-def update_config(config_data: ConfigSchema, db: Session = Depends(get_db)):
+def update_config(config_data: ConfigSchema, local_db: Session = Depends(get_local_db)):
     if not config_data.connection_name or not config_data.connection_name.strip():
         raise HTTPException(status_code=400, detail="Connection Name is required and cannot be empty.")
 
-    # Check if a connection with this name already exists
-    existing_config = db.query(SyncConfig).filter(SyncConfig.connection_name == config_data.connection_name.strip()).first()
+    # Check if a connection with this name already exists in local SQLite
+    existing_config = local_db.query(SyncConfig).filter(SyncConfig.connection_name == config_data.connection_name.strip()).first()
     if existing_config:
         raise HTTPException(status_code=400, detail=f"Connection name '{config_data.connection_name}' already exists.")
         
@@ -299,16 +392,51 @@ def update_config(config_data: ConfigSchema, db: Session = Depends(get_db)):
     config.unique_key_field = config_data.unique_key_field
     if config_data.database_name:
         config.database_name = config_data.database_name
+    if config_data.db_type:
+        config.db_type = config_data.db_type
+    if config_data.db_host:
+        config.db_host = config_data.db_host
+    if config_data.db_port:
+        config.db_port = config_data.db_port
+    if config_data.db_username is not None:
+        config.db_username = config_data.db_username
+    if config_data.db_password is not None:
+        config.db_password = config_data.db_password
     if config_data.dynamic_filters:
         config.dynamic_filters = json.dumps(config_data.dynamic_filters)
-    db.add(config)
-    db.commit()
+    local_db.add(config)
+    local_db.commit()
+
+    # Mirror to remote target database's sync_config table
+    try:
+        target_engine = get_engine_for_config(config, local_db)
+        Base.metadata.create_all(bind=target_engine)
+        TargetSession = sessionmaker(autocommit=False, autoflush=False, bind=target_engine)
+        with TargetSession() as target_session:
+            remote_cfg = target_session.query(RemoteSyncConfig).filter(RemoteSyncConfig.connection_name == config_data.connection_name.strip()).first()
+            if not remote_cfg:
+                remote_cfg = RemoteSyncConfig(
+                    connection_name=config_data.connection_name.strip(),
+                    tally_host=config_data.tally_host,
+                    tally_port=config_data.tally_port,
+                    company_name=config_data.company_name,
+                    report_name=config_data.report_name,
+                    request_xml=config_data.request_xml,
+                    scheduler_timing=config_data.scheduler_timing,
+                    file_format=config_data.file_format,
+                    database_name=config_data.database_name
+                )
+                target_session.add(remote_cfg)
+            target_session.commit()
+    except Exception as e:
+        logger.warning(f"Could not mirror config to target database: {e}")
+
     update_scheduler_job()
     return {"message": "Configuration saved successfully"}
 
 @app.put("/api/config/{connection_name}")
-def modify_config(connection_name: str, config_data: ConfigSchema, db: Session = Depends(get_db)):
-    config = db.query(SyncConfig).filter(SyncConfig.connection_name == connection_name).first()
+def modify_config(connection_name: str, config_data: ConfigSchema, local_db: Session = Depends(get_local_db)):
+    config = local_db.query(SyncConfig).filter(SyncConfig.connection_name == connection_name).first()
     if not config:
         raise HTTPException(status_code=404, detail="Connection not found")
         
@@ -323,6 +451,16 @@ def modify_config(connection_name: str, config_data: ConfigSchema, db: Session =
     config.report_name = config_data.report_name
     if config_data.database_name:
         config.database_name = config_data.database_name
+    if config_data.db_type:
+        config.db_type = config_data.db_type
+    if config_data.db_host:
+        config.db_host = config_data.db_host
+    if config_data.db_port:
+        config.db_port = config_data.db_port
+    if config_data.db_username is not None:
+        config.db_username = config_data.db_username
+    if config_data.db_password is not None:
+        config.db_password = config_data.db_password
     import json
     config.scheduler_timing = config_data.scheduler_timing
     config.file_format = config_data.file_format
@@ -330,7 +468,27 @@ def modify_config(connection_name: str, config_data: ConfigSchema, db: Session =
     config.unique_key_field = config_data.unique_key_field
     if config_data.dynamic_filters is not None:
         config.dynamic_filters = json.dumps(config_data.dynamic_filters)
-    db.commit()
+    local_db.commit()
+
+    # Mirror to remote target database's sync_config table
+    try:
+        target_engine = get_engine_for_config(config, local_db)
+        TargetSession = sessionmaker(autocommit=False, autoflush=False, bind=target_engine)
+        with TargetSession() as target_session:
+            remote_cfg = target_session.query(RemoteSyncConfig).filter(RemoteSyncConfig.connection_name == connection_name).first()
+            if remote_cfg:
+                remote_cfg.tally_host = config_data.tally_host
+                remote_cfg.tally_port = config_data.tally_port
+                remote_cfg.company_name = config_data.company_name
+                remote_cfg.report_name = config_data.report_name
+                remote_cfg.request_xml = config_data.request_xml
+                remote_cfg.scheduler_timing = config_data.scheduler_timing
+                remote_cfg.file_format = config_data.file_format
+                remote_cfg.database_name = config_data.database_name
+                target_session.commit()
+    except Exception as e:
+        logger.warning(f"Could not mirror update to target database: {e}")
+
     update_scheduler_job()
     return {"message": "Configuration updated successfully"}
 
@@ -338,51 +496,77 @@ class ToggleSchedulerSchema(BaseModel):
     scheduler_timing: Optional[str] = "5"
 
 @app.post("/api/config/{connection_name}/toggle-scheduler")
-def toggle_scheduler(connection_name: str, payload: ToggleSchedulerSchema, db: Session = Depends(get_db)):
-    config = db.query(SyncConfig).filter(SyncConfig.connection_name == connection_name).first()
+def toggle_scheduler(connection_name: str, payload: ToggleSchedulerSchema, local_db: Session = Depends(get_local_db)):
+    config = local_db.query(SyncConfig).filter(SyncConfig.connection_name == connection_name).first()
     if not config:
         raise HTTPException(status_code=404, detail="Connection not found")
     config.scheduler_timing = payload.scheduler_timing
-    db.commit()
+    local_db.commit()
     update_scheduler_job()
     return {"message": "Scheduler updated successfully", "scheduler_timing": config.scheduler_timing}
 
 @app.delete("/api/config")
 @app.delete("/api/config/{identifier}")
-def delete_config(identifier: Optional[str] = None, db: Session = Depends(get_db)):
+def delete_config(identifier: Optional[str] = None, local_db: Session = Depends(get_local_db)):
     config = None
     if identifier:
         # 1. Try finding by ID if numeric
         if identifier.isdigit():
-            config = db.query(SyncConfig).filter(SyncConfig.id == int(identifier)).first()
+            config = local_db.query(SyncConfig).filter(SyncConfig.id == int(identifier)).first()
         
         # 2. Try finding by connection_name
         if not config:
-            config = db.query(SyncConfig).filter(SyncConfig.connection_name == identifier).first()
+            config = local_db.query(SyncConfig).filter(SyncConfig.connection_name == identifier).first()
 
         # 3. Fallback for blank/empty identifier keyword
         if not config and identifier in ("blank", "empty", "null", "none"):
-            config = db.query(SyncConfig).filter((SyncConfig.connection_name == "") | (SyncConfig.connection_name == None)).first()
+            config = local_db.query(SyncConfig).filter((SyncConfig.connection_name == "") | (SyncConfig.connection_name.is_(None))).first()
     else:
         # If no identifier was passed in path (DELETE /api/config), delete the first blank connector
-        config = db.query(SyncConfig).filter((SyncConfig.connection_name == "") | (SyncConfig.connection_name == None)).first()
+        config = local_db.query(SyncConfig).filter((SyncConfig.connection_name == "") | (SyncConfig.connection_name.is_(None))).first()
         
     if config:
         conn_name = config.connection_name or f"ID #{config.id}"
-        db.delete(config)
-        db.commit()
+        # Mirror delete from remote target database's sync_config table
+        try:
+            target_engine = get_engine_for_config(config, local_db)
+            TargetSession = sessionmaker(autocommit=False, autoflush=False, bind=target_engine)
+            with TargetSession() as target_session:
+                remote_cfg = target_session.query(RemoteSyncConfig).filter(RemoteSyncConfig.connection_name == config.connection_name).first()
+                if remote_cfg:
+                    target_session.delete(remote_cfg)
+                    target_session.commit()
+        except Exception as e:
+            logger.warning(f"Could not mirror delete to target database: {e}")
+
+        local_db.delete(config)
+        local_db.commit()
         update_scheduler_job()
         return {"message": f"Connector '{conn_name}' deleted successfully"}
         
     return {"message": "No connector found"}
 
 @app.get("/api/logs")
-def get_logs(skip: int = 0, limit: int = 10, connection_name: Optional[str] = None, db: Session = Depends(get_db)):
+def get_logs(skip: int = 0, limit: int = 10, connection_name: Optional[str] = None, db: Session = Depends(get_db), local_db: Session = Depends(get_local_db)):
+    if connection_name:
+        config = local_db.query(SyncConfig).filter(SyncConfig.connection_name == connection_name).first()
+        if config:
+            try:
+                target_engine = get_engine_for_config(config, local_db)
+                TargetSession = sessionmaker(autocommit=False, autoflush=False, bind=target_engine)
+                with TargetSession() as target_db:
+                    query = target_db.query(SyncLog).filter(SyncLog.connection_name == connection_name)
+                    total = query.with_entities(func.count(SyncLog.id)).scalar() or 0
+                    logs = query.order_by(SyncLog.timestamp.desc()).offset(skip).limit(limit).all()
+                    return {"total": total, "logs": logs}
+            except Exception as e:
+                logger.debug(f"Could not get logs via connection engine for '{connection_name}': {e}")
+
     query = db.query(SyncLog)
     if connection_name:
         query = query.filter(SyncLog.connection_name == connection_name)
     
-    total = query.with_entities(func.count(SyncLog.id)).scalar()
+    total = query.with_entities(func.count(SyncLog.id)).scalar() or 0
     logs = query.order_by(SyncLog.timestamp.desc()).offset(skip).limit(limit).all()
     return {"total": total, "logs": logs}
 
@@ -420,7 +604,11 @@ def test_sync(test_data: Optional[TestConfigSchema] = None, local_db: Session = 
             if records_count > 0 and entity_name and mysql_db:
                 # Save to MySQL only if configured
                 service = SyncService(mysql_db, host, port)
-                config = mysql_db.query(SyncConfig).first()
+                config = (
+                    local_db.query(SyncConfig).filter(SyncConfig.connection_name == test_data.connection_name).first()
+                    if test_data and test_data.connection_name
+                    else local_db.query(SyncConfig).first()
+                )
                 report_name = config.report_name if config and config.report_name else "Manual_Test_Report"
                 unique_key = test_data.unique_key_field if test_data and test_data.unique_key_field else (config.unique_key_field if config else None)
                 comp_name = test_data.company_name if test_data and test_data.company_name else (config.company_name if config else None)
@@ -479,43 +667,55 @@ def test_sync(test_data: Optional[TestConfigSchema] = None, local_db: Session = 
 
 
 @app.post("/api/sync/start")
-def start_sync(background_tasks: BackgroundTasks, test_data: Optional[TestConfigSchema] = None, db: Session = Depends(get_db)):
+def start_sync(background_tasks: BackgroundTasks, test_data: Optional[TestConfigSchema] = None, local_db: Session = Depends(get_local_db)):
     """Starts a sync in the background and returns a log_id."""
     if test_data and test_data.tally_host and test_data.tally_port:
         host = test_data.tally_host
         port = test_data.tally_port
         connection_name = test_data.connection_name
     else:
-        config = db.query(SyncConfig).first()
+        config = local_db.query(SyncConfig).first()
         if not config:
             raise HTTPException(status_code=400, detail="Configuration not set")
         host = config.tally_host
         port = config.tally_port
         connection_name = config.connection_name
 
-    # Create the initial log entry
-    log_entry = SyncLog(
-        connection_name=connection_name,
-        status="IN_PROGRESS",
-        message="Sync started in background.",
-        records_fetched=0
-    )
-    db.add(log_entry)
-    db.commit()
-    db.refresh(log_entry)
-    log_id = log_entry.id
+    target_config = local_db.query(SyncConfig).filter(SyncConfig.connection_name == connection_name).first()
+    target_engine = get_engine_for_config(target_config, local_db)
+    Base.metadata.create_all(bind=target_engine)
+    TargetSession = sessionmaker(autocommit=False, autoflush=False, bind=target_engine)
+    target_db = TargetSession()
+    try:
+        # Create the initial log entry in the target database
+        log_entry = SyncLog(
+            connection_name=connection_name,
+            status="IN_PROGRESS",
+            message="Sync started in background.",
+            records_fetched=0
+        )
+        target_db.add(log_entry)
+        target_db.commit()
+        target_db.refresh(log_entry)
+        log_id = log_entry.id
+    finally:
+        target_db.close()
 
     # Fire background task
     def background_sync_task(log_id, host, port, connection_name, test_data_dict):
-        # We need a new DB session for the background task
-        engine = get_mysql_engine(next(get_local_db()))
-        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        bg_db = SessionLocal()
+        loc_db = next(get_local_db())
         try:
-            service = SyncService(bg_db, host, port)
-            service.run_sync(connection_name=connection_name, log_id=log_id, test_data_dict=test_data_dict)
+            cfg = loc_db.query(SyncConfig).filter(SyncConfig.connection_name == connection_name).first()
+            eng = get_engine_for_config(cfg, loc_db)
+            SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=eng)
+            bg_db = SessionLocal()
+            try:
+                service = SyncService(bg_db, host, port)
+                service.run_sync(connection_name=connection_name, log_id=log_id, test_data_dict=test_data_dict)
+            finally:
+                bg_db.close()
         finally:
-            bg_db.close()
+            loc_db.close()
 
     test_data_dict = test_data.dict() if test_data else None
     background_tasks.add_task(background_sync_task, log_id, host, port, connection_name, test_data_dict)
