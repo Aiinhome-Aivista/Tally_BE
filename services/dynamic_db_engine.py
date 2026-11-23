@@ -357,6 +357,8 @@ class DynamicDbEngine:
                 comp_col_obj = dynamic_table.c.get('company_name')
             has_company_col = comp_col_obj is not None
             
+            CHUNK_SIZE = 500
+
             if not unique_key:
                 logger.info(f"No unique key found. Clearing records for table {dynamic_table.name} before insert to prevent duplicates.")
                 if company_name and has_company_col:
@@ -364,22 +366,25 @@ class DynamicDbEngine:
                 else:
                     conn.execute(dynamic_table.delete())
                 if clean_data:
-                    conn.execute(dynamic_table.insert(), clean_data)
+                    for i in range(0, len(clean_data), CHUNK_SIZE):
+                        conn.execute(dynamic_table.insert(), clean_data[i:i + CHUNK_SIZE])
             else:
                 safe_unique_key = ''.join(c for c in unique_key if c.isalnum() or c == '_')
                 
                 # Extract all unique values in this batch
-                batch_unique_vals = [row[safe_unique_key] for row in clean_data if row.get(safe_unique_key)]
+                batch_unique_vals = list({row[safe_unique_key] for row in clean_data if row.get(safe_unique_key)})
                 
-                # Fetch existing ones in ONE query (scoped by COMPANY_NAME if available)
+                # Fetch existing ones in chunks of 500 (SQL Server parameter limit is 2100)
                 existing_vals = set()
                 if batch_unique_vals:
-                    where_clauses = [getattr(dynamic_table.c, safe_unique_key).in_(batch_unique_vals)]
-                    if company_name and has_company_col:
-                        where_clauses.append(comp_col_obj == company_name)
-                    sel = select(getattr(dynamic_table.c, safe_unique_key)).where(*where_clauses)
-                    result = conn.execute(sel).fetchall()
-                    existing_vals = {r[0] for r in result}
+                    for i in range(0, len(batch_unique_vals), CHUNK_SIZE):
+                        chunk = batch_unique_vals[i:i + CHUNK_SIZE]
+                        where_clauses = [getattr(dynamic_table.c, safe_unique_key).in_(chunk)]
+                        if company_name and has_company_col:
+                            where_clauses.append(comp_col_obj == company_name)
+                        sel = select(getattr(dynamic_table.c, safe_unique_key)).where(*where_clauses)
+                        result = conn.execute(sel).fetchall()
+                        existing_vals.update(r[0] for r in result)
                 
                 to_insert = []
                 to_update = []
@@ -391,22 +396,25 @@ class DynamicDbEngine:
                     else:
                         to_insert.append(row)
                 
-                # Delete existing rows to be updated (scoped by COMPANY_NAME)
+                # Delete existing rows to be updated (scoped by COMPANY_NAME) in chunks of 500
                 if to_update:
-                    delete_vals = [val for val, _ in to_update]
-                    del_where = [getattr(dynamic_table.c, safe_unique_key).in_(delete_vals)]
-                    if company_name and has_company_col:
-                        del_where.append(comp_col_obj == company_name)
-                    del_stmt = dynamic_table.delete().where(*del_where)
-                    conn.execute(del_stmt)
+                    delete_vals = list({val for val, _ in to_update})
+                    for i in range(0, len(delete_vals), CHUNK_SIZE):
+                        chunk = delete_vals[i:i + CHUNK_SIZE]
+                        del_where = [getattr(dynamic_table.c, safe_unique_key).in_(chunk)]
+                        if company_name and has_company_col:
+                            del_where.append(comp_col_obj == company_name)
+                        del_stmt = dynamic_table.delete().where(*del_where)
+                        conn.execute(del_stmt)
                     
                     # Re-add them as inserts
                     for _, row in to_update:
                         to_insert.append(row)
                 
-                # Bulk insert all rows
+                # Bulk insert all rows in chunks of 500
                 if to_insert:
-                    conn.execute(dynamic_table.insert(), to_insert)
+                    for i in range(0, len(to_insert), CHUNK_SIZE):
+                        conn.execute(dynamic_table.insert(), to_insert[i:i + CHUNK_SIZE])
                     
             conn.commit()
             logger.info(f"Successfully synced {len(clean_data)} records to {dynamic_table.name}")
