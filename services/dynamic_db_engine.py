@@ -352,7 +352,9 @@ class DynamicDbEngine:
             # Programmatic UPSERT optimized for batching, scoped by COMPANY_NAME
             logger.info("Performing optimized programmatic Upsert")
             
-            comp_col_obj = dynamic_table.c.get('COMPANY_NAME') or dynamic_table.c.get('company_name')
+            comp_col_obj = dynamic_table.c.get('COMPANY_NAME')
+            if comp_col_obj is None:
+                comp_col_obj = dynamic_table.c.get('company_name')
             has_company_col = comp_col_obj is not None
             
             if not unique_key:
@@ -395,36 +397,6 @@ class DynamicDbEngine:
                     del_where = [getattr(dynamic_table.c, safe_unique_key).in_(delete_vals)]
                     if company_name and has_company_col:
                         del_where.append(comp_col_obj == company_name)
-                    del_stmt = dynamic_table.delete().where(*del_where)
-                    conn.execute(del_stmt)
-                    
-                    # Re-add them as inserts
-                    for _, row in to_update:
-                        to_insert.append(row)
-                
-                # Bulk insert all rows
-                if to_insert:
-                    conn.execute(dynamic_table.insert(), to_insert)
-                    sel = select(getattr(dynamic_table.c, safe_unique_key)).where(*where_clauses)
-                    result = conn.execute(sel).fetchall()
-                    existing_vals = {r[0] for r in result}
-                
-                to_insert = []
-                to_update = []
-                
-                for row in clean_data:
-                    unique_val = row.get(safe_unique_key)
-                    if unique_val and unique_val in existing_vals:
-                        to_update.append((unique_val, row))
-                    else:
-                        to_insert.append(row)
-                
-                # Delete existing rows to be updated (scoped by company_name)
-                if to_update:
-                    delete_vals = [val for val, _ in to_update]
-                    del_where = [getattr(dynamic_table.c, safe_unique_key).in_(delete_vals)]
-                    if company_name and has_company_col:
-                        del_where.append(dynamic_table.c.company_name == company_name)
                     del_stmt = dynamic_table.delete().where(*del_where)
                     conn.execute(del_stmt)
                     

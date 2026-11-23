@@ -193,7 +193,7 @@ def get_config(local_db: Session = Depends(get_local_db)):
             inspector = inspect(engine)
             existing_tables = set(inspector.get_table_names())
 
-            configs = mysql_db.query(SyncConfig).all()
+            configs = mysql_db.query(SyncConfig).order_by(SyncConfig.id.desc()).all()
             result = []
             for config in configs:
                 db_name = config.database_name or (mysql_config.database_name if mysql_config else "")
