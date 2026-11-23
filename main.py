@@ -52,19 +52,53 @@ LocalBase.metadata.create_all(bind=sqlite_engine)
 _mysql_engine = None
 _mysql_db_url = None
 
+def build_engine_url(db_type, host, port, username, password, database):
+    db_type = (db_type or "mysql").lower()
+    if db_type == "sqlserver":
+        server_str = str(host or "localhost")
+        if port and str(port).strip() not in ["1433", "0", ""] and "," not in server_str and "\\" not in server_str:
+            server_str = f"{server_str},{port}"
+
+        is_windows_auth = (not username or username.strip() == "") and (not password)
+        
+        try:
+            import pyodbc
+            drivers = pyodbc.drivers()
+            driver = "ODBC Driver 17 for SQL Server" if "ODBC Driver 17 for SQL Server" in drivers else ("SQL Server" if "SQL Server" in drivers else None)
+        except Exception:
+            driver = None
+
+        if driver:
+            if is_windows_auth:
+                conn_str = f"DRIVER={{{driver}}};SERVER={server_str};DATABASE={database};Trusted_Connection=yes;TrustServerCertificate=yes;"
+            else:
+                conn_str = f"DRIVER={{{driver}}};SERVER={server_str};DATABASE={database};UID={username};PWD={password or ''};TrustServerCertificate=yes;"
+            return f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(conn_str)}"
+        else:
+            encoded_password = urllib.parse.quote_plus(password or "")
+            user_part = f"{username}:{encoded_password}@" if username else ""
+            port_part = f":{port}" if port and "\\" not in server_str else ""
+            return f"mssql+pymssql://{user_part}{server_str}{port_part}/{database}?charset=utf8"
+    else:
+        encoded_password = urllib.parse.quote_plus(password or "")
+        port_part = f":{port}" if port else ":3306"
+        return f"mysql+pymysql://{username}:{encoded_password}@{host}{port_part}/{database}"
+
 def get_mysql_engine(local_db: Session):
     global _mysql_engine, _mysql_db_url
     mysql_config = local_db.query(MysqlConfig).first()
     if not mysql_config:
         raise Exception("Database Configuration not found.")
     
-    encoded_password = urllib.parse.quote_plus(mysql_config.password or "")
     db_type = (getattr(mysql_config, 'db_type', None) or "mysql").lower()
-    
-    if db_type == "sqlserver":
-        db_url = f"mssql+pymssql://{mysql_config.username}:{encoded_password}@{mysql_config.host}:{mysql_config.port}/{mysql_config.database_name}?charset=utf8"
-    else:
-        db_url = f"mysql+pymysql://{mysql_config.username}:{encoded_password}@{mysql_config.host}:{mysql_config.port}/{mysql_config.database_name}"
+    db_url = build_engine_url(
+        db_type,
+        mysql_config.host,
+        mysql_config.port,
+        mysql_config.username,
+        mysql_config.password,
+        mysql_config.database_name
+    )
     
     # Return cached engine if the URL hasn't changed
     if _mysql_engine is not None and _mysql_db_url == db_url:
@@ -151,8 +185,8 @@ class TestConfigSchema(BaseModel):
 class MysqlConfigSchema(BaseModel):
     db_type: Optional[str] = "mysql"
     host: str
-    port: int
-    username: str
+    port: Optional[int] = None
+    username: Optional[str] = ""
     password: Optional[str] = ""
     database_name: str
 
@@ -536,7 +570,7 @@ def save_mysql_config_api(config_data: MysqlConfigSchema, db: Session = Depends(
         
         if db_type == "sqlserver":
             # In SQL Server, connect to master to check/create database
-            server_url = f"mssql+pymssql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/master?charset=utf8"
+            server_url = build_engine_url(db_type, config_data.host, config_data.port, config_data.username, config_data.password, "master")
             server_engine = sa_create_engine(server_url, isolation_level="AUTOCOMMIT")
             with server_engine.connect() as conn:
                 conn.execute(text(f"IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = N'{config_data.database_name}') CREATE DATABASE [{config_data.database_name}]"))
@@ -563,13 +597,13 @@ def validate_mysql_config(config_data: MysqlConfigSchema):
         
         if db_type == "sqlserver":
             # Connect to master database first to create database if not exists
-            server_url = f"mssql+pymssql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/master?charset=utf8"
+            server_url = build_engine_url(db_type, config_data.host, config_data.port, config_data.username, config_data.password, "master")
             server_engine = sa_create_engine(server_url, isolation_level="AUTOCOMMIT")
             with server_engine.connect() as conn:
                 conn.execute(text(f"IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = N'{config_data.database_name}') CREATE DATABASE [{config_data.database_name}]"))
 
             # Now test connection to the specific database
-            test_url = f"mssql+pymssql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/{config_data.database_name}?charset=utf8"
+            test_url = build_engine_url(db_type, config_data.host, config_data.port, config_data.username, config_data.password, config_data.database_name)
             test_engine = sa_create_engine(test_url)
             with test_engine.connect() as conn:
                 pass # successful connection
