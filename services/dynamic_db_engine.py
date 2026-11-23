@@ -86,41 +86,64 @@ class DynamicDbEngine:
         self.metadata = MetaData()
         self.engine = self.db.get_bind()
         
+    def _quote(self, name: str) -> str:
+        """Returns appropriately quoted identifier for MySQL (backticks) or SQL Server (brackets)."""
+        if self.engine.dialect.name == "mssql":
+            return f"[{name}]"
+        return f"`{name}`"
+
     def _generate_structure_hash(self, columns: List[str]) -> str:
         """Generate a SHA256 hash based on sorted column names."""
         sorted_cols = sorted(columns)
         hash_input = "|".join(sorted_cols).encode('utf-8')
         return hashlib.sha256(hash_input).hexdigest()
         
-    def _get_or_create_table(self, report_name: str, entity_name: str, columns: List[str], column_types: Dict[str, type] = None) -> Table:
+    def _get_or_create_table(self, report_name: str, entity_name: str, columns: List[str], column_types: Dict[str, type] = None, company_name: str = None) -> Table:
         if column_types is None:
             column_types = {}
             
+        # Ensure COMPANY_NAME column is always part of table columns
+        if 'COMPANY_NAME' not in columns:
+            columns.append('COMPANY_NAME')
+        if 'COMPANY_NAME' not in column_types:
+            column_types['COMPANY_NAME'] = String(255)
+
         structure_hash = self._generate_structure_hash(columns)
         
         safe_entity = ''.join(c for c in entity_name.lower() if c.isalnum() or c == '_')
         table_name = safe_entity
         
+        is_mysql = self.engine.dialect.name == "mysql"
+        is_mssql = self.engine.dialect.name == "mssql"
+        
         inspector = inspect(self.engine)
         if inspector.has_table(table_name):
             logger.info(f"Reusing existing table {table_name} for report {report_name}")
             existing_columns = [col['name'] for col in inspector.get_columns(table_name)]
+            existing_cols_upper = [c.upper() for c in existing_columns]
             
             with self.engine.begin() as conn:
                 for col_name in columns:
                     safe_col_name = ''.join(c for c in col_name if c.isalnum() or c == '_')
-                    if safe_col_name not in existing_columns:
+                    # Don't duplicate if already exists in either case
+                    if safe_col_name not in existing_columns and safe_col_name.upper() not in existing_cols_upper:
                         logger.info(f"Adding new column {safe_col_name} to {table_name}")
                         col_type = column_types.get(col_name, Text)
                         if col_type == BigInteger:
                             sql_type = "BIGINT"
                         elif col_type == DOUBLE or col_type == Float:
-                            sql_type = "DOUBLE"
+                            sql_type = "DOUBLE" if is_mysql else "FLOAT"
                         elif col_type == Date:
                             sql_type = "DATE"
+                        elif col_type == String or (isinstance(col_type, type) and issubclass(col_type, String)):
+                            sql_type = "VARCHAR(255)" if is_mysql else "NVARCHAR(255)"
                         else:
-                            sql_type = "LONGTEXT"
-                        conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {safe_col_name} {sql_type}"))
+                            sql_type = "LONGTEXT" if is_mysql else "NVARCHAR(MAX)"
+                        
+                        # Syntax ALTER TABLE table ADD col type is valid in both MySQL and SQL Server
+                        q_table = self._quote(table_name)
+                        q_col = self._quote(safe_col_name)
+                        conn.execute(text(f"ALTER TABLE {q_table} ADD {q_col} {sql_type}"))
             
             # Update metadata
             meta_entry = self.db.query(TallyTableMetadata).filter_by(table_name=table_name).first()
@@ -163,8 +186,8 @@ class DynamicDbEngine:
         
         return dynamic_table
 
-    def get_max_alter_id(self, report_name: str) -> int:
-        """Finds the alterid column dynamically and returns its max value."""
+    def get_max_alter_id(self, report_name: str, company_name: str = None) -> int:
+        """Finds the alterid column dynamically and returns its max value, filtered by company_name if provided."""
         meta = self.db.query(TallyTableMetadata).filter_by(report_name=report_name).first()
         if not meta:
             return 0
@@ -174,12 +197,13 @@ class DynamicDbEngine:
         if not inspector.has_table(table_name):
             return 0
             
-        columns = [col['name'].lower() for col in inspector.get_columns(table_name)]
+        columns = [col['name'] for col in inspector.get_columns(table_name)]
+        columns_lower = [c.lower() for c in columns]
         
         # Find alterid column (e.g. alterid, varalterid, attr_alterid)
         alter_col = None
         for col in columns:
-            if 'alterid' in col:
+            if 'alterid' in col.lower():
                 alter_col = col
                 break
                 
@@ -188,8 +212,24 @@ class DynamicDbEngine:
             
         with self.engine.connect() as conn:
             try:
-                query = text(f"SELECT MAX(`{alter_col}`) FROM `{table_name}`")
-                result = conn.execute(query).scalar()
+                # Find company column in either uppercase or lowercase
+                comp_col = None
+                for col in columns:
+                    if col.upper() == 'COMPANY_NAME':
+                        comp_col = col
+                        break
+
+                q_alter = self._quote(alter_col)
+                q_table = self._quote(table_name)
+                
+                if company_name and comp_col:
+                    q_comp = self._quote(comp_col)
+                    query = text(f"SELECT MAX({q_alter}) FROM {q_table} WHERE {q_comp} = :company_name")
+                    result = conn.execute(query, {"company_name": company_name}).scalar()
+                else:
+                    query = text(f"SELECT MAX({q_alter}) FROM {q_table}")
+                    result = conn.execute(query).scalar()
+                    
                 if result:
                     return int(result)
             except Exception as e:
@@ -208,10 +248,15 @@ class DynamicDbEngine:
                 return cand
         return None # No clear unique key
 
-    def sync_data(self, report_name: str, entity_name: str, data: List[Dict], unique_key_field: str = None):
+    def sync_data(self, report_name: str, entity_name: str, data: List[Dict], unique_key_field: str = None, company_name: str = None):
         if not data:
             logger.warning("No data provided to sync.")
             return
+
+        # Ensure COMPANY_NAME is present in all records (uppercase)
+        if company_name:
+            for item in data:
+                item['COMPANY_NAME'] = company_name
 
         # Determine all unique columns across the dataset
         all_columns_set = set()
@@ -219,6 +264,10 @@ class DynamicDbEngine:
             all_columns_set.update(item.keys())
         all_columns = list(all_columns_set)
         
+        # Ensure COMPANY_NAME column is tracked
+        if 'COMPANY_NAME' not in all_columns:
+            all_columns.append('COMPANY_NAME')
+
         column_samples = {k: [] for k in all_columns}
         for item in data:
             for k, v in item.items():
@@ -227,10 +276,13 @@ class DynamicDbEngine:
                     
         column_types = {}
         for k, v in column_samples.items():
-            column_types[k] = detect_column_type(v)
+            if k.upper() == 'COMPANY_NAME':
+                column_types[k] = String(255)
+            else:
+                column_types[k] = detect_column_type(v)
         
-        # Get or create table
-        dynamic_table = self._get_or_create_table(report_name, entity_name, all_columns, column_types)
+        # Get or create table with COMPANY_NAME column
+        dynamic_table = self._get_or_create_table(report_name, entity_name, all_columns, column_types, company_name=company_name)
         
         # Query actual column types from dynamic_table to know real DB types
         db_column_types = {}
@@ -297,30 +349,18 @@ class DynamicDbEngine:
                     clean_item[safe_k] = v
                 clean_data.append(clean_item)
 
-            if unique_key:
-                safe_unique_key = ''.join(c for c in unique_key if c.isalnum() or c == '_')
-                logger.info(f"Performing UPSERT using unique key: {unique_key}")
-                
-                # We use MySQL's INSERT ... ON DUPLICATE KEY UPDATE
-                stmt = insert(dynamic_table).values(clean_data)
-                
-                update_dict = {
-                    c.name: c for c in stmt.inserted if c.name not in ('id', safe_unique_key)
-                }
-                
-                if update_dict:
-                    upsert_stmt = stmt.on_duplicate_key_update(**update_dict)
-                    # For ON DUPLICATE KEY UPDATE to work, the unique key column needs a UNIQUE constraint
-                    # Since we create dynamic tables without UNIQUE constraints (because we don't know types),
-                    # standard UPSERT might fail if there's no unique index. 
-                    # Let's do a programmatic upsert for safety.
-            
-            # Programmatic UPSERT fallback optimized for batching
+            # Programmatic UPSERT optimized for batching, scoped by COMPANY_NAME
             logger.info("Performing optimized programmatic Upsert")
             
+            comp_col_obj = dynamic_table.c.get('COMPANY_NAME') or dynamic_table.c.get('company_name')
+            has_company_col = comp_col_obj is not None
+            
             if not unique_key:
-                logger.info(f"No unique key found. Clearing table {dynamic_table.name} before insert to prevent duplicates.")
-                conn.execute(dynamic_table.delete())
+                logger.info(f"No unique key found. Clearing records for table {dynamic_table.name} before insert to prevent duplicates.")
+                if company_name and has_company_col:
+                    conn.execute(dynamic_table.delete().where(comp_col_obj == company_name))
+                else:
+                    conn.execute(dynamic_table.delete())
                 if clean_data:
                     conn.execute(dynamic_table.insert(), clean_data)
             else:
@@ -329,10 +369,13 @@ class DynamicDbEngine:
                 # Extract all unique values in this batch
                 batch_unique_vals = [row[safe_unique_key] for row in clean_data if row.get(safe_unique_key)]
                 
-                # Fetch existing ones in ONE query
+                # Fetch existing ones in ONE query (scoped by COMPANY_NAME if available)
                 existing_vals = set()
                 if batch_unique_vals:
-                    sel = select(getattr(dynamic_table.c, safe_unique_key)).where(getattr(dynamic_table.c, safe_unique_key).in_(batch_unique_vals))
+                    where_clauses = [getattr(dynamic_table.c, safe_unique_key).in_(batch_unique_vals)]
+                    if company_name and has_company_col:
+                        where_clauses.append(comp_col_obj == company_name)
+                    sel = select(getattr(dynamic_table.c, safe_unique_key)).where(*where_clauses)
                     result = conn.execute(sel).fetchall()
                     existing_vals = {r[0] for r in result}
                 
@@ -346,10 +389,43 @@ class DynamicDbEngine:
                     else:
                         to_insert.append(row)
                 
-                # Delete existing rows to be updated
+                # Delete existing rows to be updated (scoped by COMPANY_NAME)
                 if to_update:
                     delete_vals = [val for val, _ in to_update]
-                    del_stmt = dynamic_table.delete().where(getattr(dynamic_table.c, safe_unique_key).in_(delete_vals))
+                    del_where = [getattr(dynamic_table.c, safe_unique_key).in_(delete_vals)]
+                    if company_name and has_company_col:
+                        del_where.append(comp_col_obj == company_name)
+                    del_stmt = dynamic_table.delete().where(*del_where)
+                    conn.execute(del_stmt)
+                    
+                    # Re-add them as inserts
+                    for _, row in to_update:
+                        to_insert.append(row)
+                
+                # Bulk insert all rows
+                if to_insert:
+                    conn.execute(dynamic_table.insert(), to_insert)
+                    sel = select(getattr(dynamic_table.c, safe_unique_key)).where(*where_clauses)
+                    result = conn.execute(sel).fetchall()
+                    existing_vals = {r[0] for r in result}
+                
+                to_insert = []
+                to_update = []
+                
+                for row in clean_data:
+                    unique_val = row.get(safe_unique_key)
+                    if unique_val and unique_val in existing_vals:
+                        to_update.append((unique_val, row))
+                    else:
+                        to_insert.append(row)
+                
+                # Delete existing rows to be updated (scoped by company_name)
+                if to_update:
+                    delete_vals = [val for val, _ in to_update]
+                    del_where = [getattr(dynamic_table.c, safe_unique_key).in_(delete_vals)]
+                    if company_name and has_company_col:
+                        del_where.append(dynamic_table.c.company_name == company_name)
+                    del_stmt = dynamic_table.delete().where(*del_where)
                     conn.execute(del_stmt)
                     
                     # Re-add them as inserts

@@ -55,11 +55,11 @@ class SyncService:
                 
             last_alter_id = config.last_alter_id or 0
             
-            # Dynamically fetch max alter ID from the actual data table
-            db_max_alter_id = self.db_engine.get_max_alter_id(report_name)
+            # Dynamically fetch max alter ID from the actual data table with company_name filter
+            db_max_alter_id = self.db_engine.get_max_alter_id(report_name, company_name=config.company_name)
             if db_max_alter_id > last_alter_id:
                 last_alter_id = db_max_alter_id
-                logger.info(f"Using actual max alter ID {last_alter_id} from database table.")
+                logger.info(f"Using actual max alter ID {last_alter_id} from database table for company {config.company_name}.")
                 
             if "{LAST_ALTER_ID}" in request_payload:
                 request_payload = request_payload.replace("{LAST_ALTER_ID}", str(last_alter_id))
@@ -140,7 +140,7 @@ class SyncService:
                         xml_parts.append("</PREVIEW>")
                         preview_data = "\n".join(xml_parts)
                     
-                    self.db_engine.sync_data(report_name, entity_name, batch, unique_key_field=unique_key)
+                    self.db_engine.sync_data(report_name, entity_name, batch, unique_key_field=unique_key, company_name=config.company_name)
                     total_records += len(batch)
                     logger.info(f"[{entity_name}] Inserted batch of {len(batch)} records. Total: {total_records}")
                     entity_batches[entity_name] = []
@@ -159,7 +159,7 @@ class SyncService:
                         xml_parts.append("  </RECORD>")
                     xml_parts.append("</PREVIEW>")
                     preview_data = "\n".join(xml_parts)
-                self.db_engine.sync_data(report_name, ename, batch, unique_key_field=unique_key)
+                self.db_engine.sync_data(report_name, ename, batch, unique_key_field=unique_key, company_name=config.company_name)
                 total_records += len(batch)
                 logger.info(f"[{ename}] Final batch of {len(batch)} records. Total: {total_records}")
                 

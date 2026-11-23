@@ -29,6 +29,20 @@ LocalBase = declarative_base()
 # 2. Main Target Database Base (Tables will be created dynamically when engine is known)
 Base = declarative_base()
 
+def init_sqlite_migrations():
+    """Ensure SQLite schema is up-to-date."""
+    from sqlalchemy import text
+    with sqlite_engine.connect() as conn:
+        try:
+            cols = [row[1] for row in conn.execute(text("PRAGMA table_info(mysql_config)")).fetchall()]
+            if cols and "db_type" not in cols:
+                conn.execute(text("ALTER TABLE mysql_config ADD COLUMN db_type VARCHAR(50) DEFAULT 'mysql'"))
+                conn.commit()
+        except Exception:
+            pass
+
+init_sqlite_migrations()
+
 def get_local_db():
     db = LocalSessionLocal()
     try:

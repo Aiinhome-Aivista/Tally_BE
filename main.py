@@ -56,10 +56,15 @@ def get_mysql_engine(local_db: Session):
     global _mysql_engine, _mysql_db_url
     mysql_config = local_db.query(MysqlConfig).first()
     if not mysql_config:
-        raise Exception("MySQL Configuration not found.")
+        raise Exception("Database Configuration not found.")
     
     encoded_password = urllib.parse.quote_plus(mysql_config.password or "")
-    db_url = f"mysql+pymysql://{mysql_config.username}:{encoded_password}@{mysql_config.host}:{mysql_config.port}/{mysql_config.database_name}"
+    db_type = (getattr(mysql_config, 'db_type', None) or "mysql").lower()
+    
+    if db_type == "sqlserver":
+        db_url = f"mssql+pymssql://{mysql_config.username}:{encoded_password}@{mysql_config.host}:{mysql_config.port}/{mysql_config.database_name}?charset=utf8"
+    else:
+        db_url = f"mysql+pymysql://{mysql_config.username}:{encoded_password}@{mysql_config.host}:{mysql_config.port}/{mysql_config.database_name}"
     
     # Return cached engine if the URL hasn't changed
     if _mysql_engine is not None and _mysql_db_url == db_url:
@@ -116,6 +121,7 @@ app.add_middleware(
 
 # Pydantic schemas
 class ConfigSchema(BaseModel):
+    id: Optional[int] = None
     connection_name: str
     tally_host: str
     tally_port: int
@@ -143,6 +149,7 @@ class TestConfigSchema(BaseModel):
     database_name: Optional[str] = None
 
 class MysqlConfigSchema(BaseModel):
+    db_type: Optional[str] = "mysql"
     host: str
     port: int
     username: str
@@ -189,19 +196,16 @@ def get_config(local_db: Session = Depends(get_local_db)):
             configs = mysql_db.query(SyncConfig).all()
             result = []
             for config in configs:
-                db_name = mysql_config.database_name if mysql_config else ""
-                if not db_name and config.company_name:
-                    import re
-                    # Same logic as frontend generateDbName
-                    db_name = re.sub(r'[^a-z0-9]', '_', config.company_name.lower())
-                    db_name = re.sub(r'_+', '_', db_name).strip('_')
+                db_name = config.database_name or (mysql_config.database_name if mysql_config else "")
 
                 # Calculate total rows in the target table
                 table_name = ''.join(c for c in (config.report_name or "").lower() if c.isalnum() or c == '_')
                 total_rows = 0
                 if table_name and table_name in existing_tables:
                     try:
-                        row_count = mysql_db.execute(text(f"SELECT COUNT(*) FROM `{table_name}`")).scalar()
+                        is_mssql = engine.dialect.name == "mssql"
+                        quoted_tbl = f"[{table_name}]" if is_mssql else f"`{table_name}`"
+                        row_count = mysql_db.execute(text(f"SELECT COUNT(*) FROM {quoted_tbl}")).scalar()
                         total_rows = int(row_count) if row_count is not None else 0
                     except Exception:
                         total_rows = 0
@@ -216,6 +220,7 @@ def get_config(local_db: Session = Depends(get_local_db)):
                         total_rows = last_valid_log.records_fetched or 0
 
                 result.append({
+                    "id": config.id,
                     "connection_name": config.connection_name,
                     "tally_host": config.tally_host,
                     "tally_port": config.tally_port,
@@ -239,13 +244,16 @@ def get_config(local_db: Session = Depends(get_local_db)):
 
 @app.post("/api/config")
 def update_config(config_data: ConfigSchema, db: Session = Depends(get_db)):
+    if not config_data.connection_name or not config_data.connection_name.strip():
+        raise HTTPException(status_code=400, detail="Connection Name is required and cannot be empty.")
+
     # Check if a connection with this name already exists
-    existing_config = db.query(SyncConfig).filter(SyncConfig.connection_name == config_data.connection_name).first()
+    existing_config = db.query(SyncConfig).filter(SyncConfig.connection_name == config_data.connection_name.strip()).first()
     if existing_config:
         raise HTTPException(status_code=400, detail=f"Connection name '{config_data.connection_name}' already exists.")
         
     config = SyncConfig()
-    config.connection_name = config_data.connection_name
+    config.connection_name = config_data.connection_name.strip()
     config.tally_host = config_data.tally_host
     config.tally_port = config_data.tally_port
     config.company_name = config_data.company_name
@@ -255,6 +263,8 @@ def update_config(config_data: ConfigSchema, db: Session = Depends(get_db)):
     config.file_format = config_data.file_format
     config.request_xml = config_data.request_xml
     config.unique_key_field = config_data.unique_key_field
+    if config_data.database_name:
+        config.database_name = config_data.database_name
     if config_data.dynamic_filters:
         config.dynamic_filters = json.dumps(config_data.dynamic_filters)
     db.add(config)
@@ -277,6 +287,8 @@ def modify_config(connection_name: str, config_data: ConfigSchema, db: Session =
         config.last_alter_id = 0
         
     config.report_name = config_data.report_name
+    if config_data.database_name:
+        config.database_name = config_data.database_name
     import json
     config.scheduler_timing = config_data.scheduler_timing
     config.file_format = config_data.file_format
@@ -301,14 +313,33 @@ def toggle_scheduler(connection_name: str, payload: ToggleSchedulerSchema, db: S
     update_scheduler_job()
     return {"message": "Scheduler updated successfully", "scheduler_timing": config.scheduler_timing}
 
-@app.delete("/api/config/{connection_name}")
-def delete_config(connection_name: str, db: Session = Depends(get_db)):
-    config = db.query(SyncConfig).filter(SyncConfig.connection_name == connection_name).first()
+@app.delete("/api/config")
+@app.delete("/api/config/{identifier}")
+def delete_config(identifier: Optional[str] = None, db: Session = Depends(get_db)):
+    config = None
+    if identifier:
+        # 1. Try finding by ID if numeric
+        if identifier.isdigit():
+            config = db.query(SyncConfig).filter(SyncConfig.id == int(identifier)).first()
+        
+        # 2. Try finding by connection_name
+        if not config:
+            config = db.query(SyncConfig).filter(SyncConfig.connection_name == identifier).first()
+
+        # 3. Fallback for blank/empty identifier keyword
+        if not config and identifier in ("blank", "empty", "null", "none"):
+            config = db.query(SyncConfig).filter((SyncConfig.connection_name == "") | (SyncConfig.connection_name == None)).first()
+    else:
+        # If no identifier was passed in path (DELETE /api/config), delete the first blank connector
+        config = db.query(SyncConfig).filter((SyncConfig.connection_name == "") | (SyncConfig.connection_name == None)).first()
+        
     if config:
+        conn_name = config.connection_name or f"ID #{config.id}"
         db.delete(config)
         db.commit()
         update_scheduler_job()
-        return {"message": "Connector deleted successfully"}
+        return {"message": f"Connector '{conn_name}' deleted successfully"}
+        
     return {"message": "No connector found"}
 
 @app.get("/api/logs")
@@ -357,7 +388,8 @@ def test_sync(test_data: Optional[TestConfigSchema] = None, local_db: Session = 
                 config = mysql_db.query(SyncConfig).first()
                 report_name = config.report_name if config and config.report_name else "Manual_Test_Report"
                 unique_key = test_data.unique_key_field if test_data and test_data.unique_key_field else (config.unique_key_field if config else None)
-                service.db_engine.sync_data(report_name, entity_name, parsed_data, unique_key_field=unique_key)
+                comp_name = test_data.company_name if test_data and test_data.company_name else (config.company_name if config else None)
+                service.db_engine.sync_data(report_name, entity_name, parsed_data, unique_key_field=unique_key, company_name=comp_name)
                 msg = f"Connection successful. {records_count} records saved to database table."
             elif records_count > 0:
                 msg = f"Connection successful. {records_count} records found. (Configure MySQL to save data)"
@@ -488,6 +520,7 @@ def save_mysql_config_api(config_data: MysqlConfigSchema, db: Session = Depends(
         config = MysqlConfig()
         db.add(config)
         
+    config.db_type = (config_data.db_type or "mysql").lower()
     config.host = config_data.host
     config.port = config_data.port
     config.username = config_data.username
@@ -495,40 +528,64 @@ def save_mysql_config_api(config_data: MysqlConfigSchema, db: Session = Depends(
     config.database_name = config_data.database_name
     db.commit()
     
-    # Try to connect and create the internal tables in the new MySQL database
+    # Try to connect and create the database if not exists, and create tables in the database
     try:
         encoded_password = urllib.parse.quote_plus(config_data.password or "")
-        server_url = f"mysql+pymysql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/"
-        server_engine = sa_create_engine(server_url)
-        with server_engine.connect() as conn:
-            conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{config_data.database_name}`"))
+        db_type = (config_data.db_type or "mysql").lower()
+        
+        if db_type == "sqlserver":
+            # In SQL Server, connect to master to check/create database
+            server_url = f"mssql+pymssql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/master?charset=utf8"
+            server_engine = sa_create_engine(server_url, isolation_level="AUTOCOMMIT")
+            with server_engine.connect() as conn:
+                conn.execute(text(f"IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = N'{config_data.database_name}') CREATE DATABASE [{config_data.database_name}]"))
+        else:
+            # In MySQL, connect to server without database
+            server_url = f"mysql+pymysql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/"
+            server_engine = sa_create_engine(server_url)
+            with server_engine.connect() as conn:
+                conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{config_data.database_name}`"))
             
         engine = get_mysql_engine(db)
         Base.metadata.create_all(bind=engine)
     except Exception as e:
-        logger.error(f"Failed to create tables in target MySQL database: {e}")
+        logger.error(f"Failed to create tables in target database: {e}")
         raise HTTPException(status_code=500, detail=f"Configuration saved, but failed to initialize tables: {str(e)}")
         
-    return {"message": "MySQL Configuration saved successfully"}
+    return {"message": "Database Configuration saved successfully"}
 
 @app.post("/api/mysql/validate")
 def validate_mysql_config(config_data: MysqlConfigSchema):
     try:
-        # URL encode password in case it has special chars like @
         encoded_password = urllib.parse.quote_plus(config_data.password or "")
+        db_type = (config_data.db_type or "mysql").lower()
         
-        # Connect to MySQL server WITHOUT specifying database name first to create it if missing
-        server_url = f"mysql+pymysql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/"
-        server_engine = sa_create_engine(server_url)
-        with server_engine.connect() as conn:
-            conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{config_data.database_name}`"))
+        if db_type == "sqlserver":
+            # Connect to master database first to create database if not exists
+            server_url = f"mssql+pymssql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/master?charset=utf8"
+            server_engine = sa_create_engine(server_url, isolation_level="AUTOCOMMIT")
+            with server_engine.connect() as conn:
+                conn.execute(text(f"IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = N'{config_data.database_name}') CREATE DATABASE [{config_data.database_name}]"))
 
-        # Now test connection to the specific database
-        test_url = f"mysql+pymysql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/{config_data.database_name}"
-        test_engine = sa_create_engine(test_url)
-        with test_engine.connect() as conn:
-            pass # successful connection
-        return {"status": "SUCCESS", "message": "MySQL Connection Successful & DB Ready"}
+            # Now test connection to the specific database
+            test_url = f"mssql+pymssql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/{config_data.database_name}?charset=utf8"
+            test_engine = sa_create_engine(test_url)
+            with test_engine.connect() as conn:
+                pass # successful connection
+            return {"status": "SUCCESS", "message": "SQL Server Connection Successful & Database Ready"}
+        else:
+            # Connect to MySQL server WITHOUT specifying database name first to create it if missing
+            server_url = f"mysql+pymysql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/"
+            server_engine = sa_create_engine(server_url)
+            with server_engine.connect() as conn:
+                conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{config_data.database_name}`"))
+
+            # Now test connection to the specific database
+            test_url = f"mysql+pymysql://{config_data.username}:{encoded_password}@{config_data.host}:{config_data.port}/{config_data.database_name}"
+            test_engine = sa_create_engine(test_url)
+            with test_engine.connect() as conn:
+                pass # successful connection
+            return {"status": "SUCCESS", "message": "MySQL Connection Successful & Database Ready"}
     except OperationalError as e:
         raise HTTPException(status_code=400, detail=f"Connection failed: {str(e.orig)}")
     except Exception as e:

@@ -20,6 +20,8 @@ class SyncConfig(Base):
     last_alter_id = Column(Integer, default=0)
     unique_key_field = Column(String(100), nullable=True)
     dynamic_filters = Column(Text, nullable=True)
+    database_name = Column(String(255), nullable=True)
+    db_type = Column(String(50), default="mysql", nullable=True)
 
 class SyncLog(Base):
     __tablename__ = "sync_logs"
@@ -48,8 +50,12 @@ class MysqlConfig(LocalBase):
     __tablename__ = "mysql_config"
 
     id = Column(Integer, primary_key=True, index=True)
+    db_type = Column(String(50), default="mysql", nullable=True) # "mysql" or "sqlserver"
     host = Column(String(255), nullable=False)
     port = Column(Integer, nullable=False)
     username = Column(String(255), nullable=False)
     password = Column(String(255), nullable=True)
     database_name = Column(String(255), nullable=False)
+
+# Alias for generic database configuration
+DbConfig = MysqlConfig
