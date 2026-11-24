@@ -41,6 +41,17 @@ class SyncService:
                 config = local_db.query(SyncConfig).first()
                 
             if not config:
+                # Fallback: check target database's sync_config table
+                try:
+                    from models.config import SyncConfig as RemoteSyncConfig
+                    if connection_name:
+                        config = self.db.query(RemoteSyncConfig).filter(RemoteSyncConfig.connection_name == connection_name).first()
+                    else:
+                        config = self.db.query(RemoteSyncConfig).first()
+                except Exception:
+                    pass
+
+            if not config:
                 raise Exception("No sync configuration found. Please validate connection in the UI.")
                 
             report_name = config.report_name or "Unknown Report"

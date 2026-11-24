@@ -128,10 +128,42 @@ def get_db(local_db: Session = Depends(get_local_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+def ensure_database_exists(db_type, host, port, username, password, database_name):
+    """Ensures target database exists on MySQL or SQL Server before connecting."""
+    if not database_name:
+        return
+    db_type = (db_type or "mysql").lower()
+    from sqlalchemy import create_engine as sa_create_engine, text
+    try:
+        if db_type == "sqlserver":
+            master_url = build_engine_url(db_type, host, port, username, password, "master")
+            master_engine = sa_create_engine(master_url, isolation_level="AUTOCOMMIT")
+            with master_engine.connect() as conn:
+                conn.execute(text(f"IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = N'{database_name}') CREATE DATABASE [{database_name}]"))
+            master_engine.dispose()
+        else:
+            encoded_password = urllib.parse.quote_plus(password or "")
+            port_part = f":{port}" if port else ":3306"
+            root_url = f"mysql+pymysql://{username}:{encoded_password}@{host}{port_part}/"
+            root_engine = sa_create_engine(root_url)
+            with root_engine.connect() as conn:
+                conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{database_name}`"))
+            root_engine.dispose()
+    except Exception as e:
+        logger.debug(f"ensure_database_exists notice: {e}")
+
 def get_engine_for_config(config, local_db: Session = None):
     """Returns engine for a specific SyncConfig based on its stored database credentials, or falls back to global."""
     from sqlalchemy import create_engine as sa_create_engine
     if config and config.db_host and config.database_name:
+        ensure_database_exists(
+            config.db_type,
+            config.db_host,
+            config.db_port,
+            config.db_username,
+            config.db_password,
+            config.database_name
+        )
         db_url = build_engine_url(
             config.db_type,
             config.db_host,
@@ -337,7 +369,7 @@ def update_config(config_data: ConfigSchema, local_db: Session = Depends(get_loc
     # Check if a connection with this name already exists in local SQLite
     existing_config = local_db.query(SyncConfig).filter(SyncConfig.connection_name == config_data.connection_name.strip()).first()
     if existing_config:
-        raise HTTPException(status_code=400, detail=f"Connection name '{config_data.connection_name}' already exists.")
+        raise HTTPException(status_code=400, detail=f"Connection name '{config_data.connection_name.strip()}' already exists. Please choose a unique name.")
         
     config = SyncConfig()
     config.connection_name = config_data.connection_name.strip()
