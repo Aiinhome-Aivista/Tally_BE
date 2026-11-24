@@ -144,6 +144,9 @@ class TallyService:
                     depth += 1
                 elif event == "end":
                     depth -= 1
+                    if elem.tag == "LINEERROR" and elem.text and elem.text.strip():
+                        raise Exception(f"Tally Error: {elem.text.strip()}")
+
                     if depth == 1 and elem.tag not in skip_tags:
                         base_entity = re.sub(r'\d+$', '', elem.tag)
                         item_data = {}

@@ -74,7 +74,7 @@ def detect_column_type(values: List[str]):
     if is_int and not is_date:
         return BigInteger
     if is_float:
-        return DOUBLE   # Use DOUBLE (not FLOAT) for full precision
+        return Float().with_variant(DOUBLE(), "mysql")
     if is_date:
         return Date
 
@@ -131,7 +131,7 @@ class DynamicDbEngine:
                         col_type = column_types.get(col_name, Text)
                         if col_type == BigInteger:
                             sql_type = "BIGINT"
-                        elif col_type == DOUBLE or col_type == Float:
+                        elif col_type == DOUBLE or col_type == Float or isinstance(col_type, (Float, DOUBLE)):
                             sql_type = "DOUBLE" if is_mysql else "FLOAT"
                         elif col_type == Date:
                             sql_type = "DATE"
@@ -246,7 +246,18 @@ class DynamicDbEngine:
         for cand in candidates:
             if cand in columns:
                 return cand
-        return None # No clear unique key
+
+        # Check for any column ending with MASTERID (e.g. VCHINVMASTERID, VCHLEDMASTERID, SJMASTERID, VCHBILLMASTERID, VCHCCMASTERID)
+        for col in columns:
+            if col.upper().endswith('MASTERID'):
+                return col
+                
+        # Check for any column ending with ALTERID (e.g. VCHINVALTERID, VCHLEDALTERID, SJALTERID)
+        for col in columns:
+            if col.upper().endswith('ALTERID'):
+                return col
+
+        return None
 
     def sync_data(self, report_name: str, entity_name: str, data: List[Dict], unique_key_field: str = None, company_name: str = None):
         if not data:
@@ -322,7 +333,7 @@ class DynamicDbEngine:
                                         continue
                                 if not parsed:
                                     v = None
-                        elif col_type in (DOUBLE, Float) or actual_db_type in (DOUBLE, Float):
+                        elif col_type in (DOUBLE, Float) or isinstance(col_type, (Float, DOUBLE)) or actual_db_type in (DOUBLE, Float) or (isinstance(actual_db_type, type) and issubclass(actual_db_type, (Float, DOUBLE))):
                             v_clean = v_str.replace("(-)", "-")
                             if v_clean == "":
                                 v = None
@@ -360,11 +371,6 @@ class DynamicDbEngine:
             CHUNK_SIZE = 500
 
             if not unique_key:
-                logger.info(f"No unique key found. Clearing records for table {dynamic_table.name} before insert to prevent duplicates.")
-                if company_name and has_company_col:
-                    conn.execute(dynamic_table.delete().where(comp_col_obj == company_name))
-                else:
-                    conn.execute(dynamic_table.delete())
                 if clean_data:
                     for i in range(0, len(clean_data), CHUNK_SIZE):
                         conn.execute(dynamic_table.insert(), clean_data[i:i + CHUNK_SIZE])

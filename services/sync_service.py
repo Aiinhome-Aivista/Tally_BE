@@ -184,23 +184,6 @@ class SyncService:
             log_entry = self.db.query(SyncLog).filter(SyncLog.id == log_id).first()
             if log_entry:
                 from sqlalchemy.sql import func
-                
-                # Check if we should update the existing 0-record log rather than creating duplicate 0-record rows
-                if total_records == 0:
-                    latest_prior_log = self.db.query(SyncLog).filter(
-                        SyncLog.connection_name == connection_name,
-                        SyncLog.id != log_id
-                    ).order_by(SyncLog.timestamp.desc()).first()
-                    
-                    if latest_prior_log and latest_prior_log.status == "SUCCESS" and (latest_prior_log.records_fetched or 0) == 0:
-                        # Update the previous 0-record log's timestamp and delete this redundant temporary log
-                        latest_prior_log.timestamp = func.now()
-                        latest_prior_log.message = "Sync completed successfully. No new changes."
-                        self.db.delete(log_entry)
-                        self.db.commit()
-                        logger.info(f"Updated timestamp of existing 0-record log for '{connection_name}'.")
-                        return
-
                 log_entry.status = "SUCCESS"
                 log_entry.message = "Sync completed successfully." if total_records > 0 else "Sync completed successfully. No new changes."
                 log_entry.records_fetched = total_records

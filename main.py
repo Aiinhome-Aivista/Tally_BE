@@ -152,87 +152,8 @@ def get_engine_for_config(config, local_db: Session = None):
         db.close()
 
 def sync_existing_connections_to_local_sqlite(local_db: Session):
-    """
-    Recovers and mirrors any existing connections from MySQL and SQL Server into local SQLite sync_config,
-    ensuring all connections (MySQL + MSSQL) appear together in the central table.
-    """
-    from sqlalchemy import create_engine as sa_create_engine
-    try:
-        # 1. Try recovering from MySQL (default localhost:3306, root, company1)
-        try:
-            mysql_url = "mysql+pymysql://root:@localhost:3306/company1"
-            mysql_eng = sa_create_engine(mysql_url)
-            with mysql_eng.connect() as conn:
-                from sqlalchemy import inspect
-                insp = inspect(mysql_eng)
-                if "sync_config" in insp.get_table_names():
-                    rows = conn.execute(text("SELECT connection_name, tally_host, tally_port, company_name, report_name, request_xml, scheduler_timing, file_format, last_alter_id, unique_key_field, dynamic_filters, database_name FROM sync_config")).fetchall()
-                    for r in rows:
-                        c_name = r[0]
-                        if c_name and not local_db.query(SyncConfig).filter(SyncConfig.connection_name == c_name).first():
-                            new_cfg = SyncConfig(
-                                connection_name=c_name,
-                                tally_host=r[1] or "localhost",
-                                tally_port=int(r[2] or 9000),
-                                company_name=r[3],
-                                report_name=r[4],
-                                request_xml=r[5],
-                                scheduler_timing=r[6],
-                                file_format=r[7] or "XML",
-                                last_alter_id=int(r[8] or 0),
-                                unique_key_field=r[9],
-                                dynamic_filters=r[10],
-                                database_name=r[11] or "company1",
-                                db_type="mysql",
-                                db_host="localhost",
-                                db_port=3306,
-                                db_username="root",
-                                db_password=""
-                            )
-                            local_db.add(new_cfg)
-                    local_db.commit()
-        except Exception as e:
-            logger.debug(f"MySQL recovery check: {e}")
-
-        # 2. Try recovering from SQL Server (SONIA\SQLEXPRESS or localhost, kidcity_solutions_pvt_ltd_25_26)
-        try:
-            mssql_cfg = local_db.query(MysqlConfig).filter(MysqlConfig.db_type == "sqlserver").first()
-            if mssql_cfg:
-                mssql_url = build_engine_url("sqlserver", mssql_cfg.host, mssql_cfg.port, mssql_cfg.username, mssql_cfg.password, mssql_cfg.database_name)
-                mssql_eng = sa_create_engine(mssql_url)
-                with mssql_eng.connect() as conn:
-                    from sqlalchemy import inspect
-                    insp = inspect(mssql_eng)
-                    if "sync_config" in insp.get_table_names():
-                        rows = conn.execute(text("SELECT connection_name, tally_host, tally_port, company_name, report_name, request_xml, scheduler_timing, file_format, last_alter_id, unique_key_field, dynamic_filters, database_name FROM sync_config")).fetchall()
-                        for r in rows:
-                            c_name = r[0]
-                            if c_name and not local_db.query(SyncConfig).filter(SyncConfig.connection_name == c_name).first():
-                                new_cfg = SyncConfig(
-                                    connection_name=c_name,
-                                    tally_host=r[1] or "localhost",
-                                    tally_port=int(r[2] or 9000),
-                                    company_name=r[3],
-                                    report_name=r[4],
-                                    request_xml=r[5],
-                                    scheduler_timing=r[6],
-                                    file_format=r[7] or "XML",
-                                    last_alter_id=int(r[8] or 0),
-                                    unique_key_field=r[9],
-                                    dynamic_filters=r[10],
-                                    database_name=r[11] or mssql_cfg.database_name,
-                                    db_type="sqlserver",
-                                    db_host=mssql_cfg.host,
-                                    db_port=mssql_cfg.port,
-                                    db_username=mssql_cfg.username,
-                                    db_password=mssql_cfg.password
-                                )
-                                local_db.add(new_cfg)
-                        local_db.commit()
-        except Exception as e:
-            logger.debug(f"SQL Server recovery check: {e}")
-    except Exception as e:
-        logger.warning(f"Error syncing existing connections: {e}")
+    """No-op: All connections are strictly user-managed."""
+    pass
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -331,19 +252,58 @@ def get_config(local_db: Session = Depends(get_local_db)):
     for config in configs:
         db_name = config.database_name or ""
         total_rows = 0
-        table_name = ''.join(c for c in (config.report_name or "").lower() if c.isalnum() or c == '_')
+        rep_name = (config.report_name or "").strip()
+        table_name = ''.join(c for c in rep_name.lower() if c.isalnum() or c == '_')
         if table_name:
             try:
                 target_engine = get_engine_for_config(config, local_db)
                 from sqlalchemy import inspect
                 inspector = inspect(target_engine)
-                if table_name in inspector.get_table_names():
-                    is_mssql = target_engine.dialect.name == "mssql"
-                    quoted_tbl = f"[{table_name}]" if is_mssql else f"`{table_name}`"
+                all_tables = inspector.get_table_names()
+                all_tables_lower = {t.lower(): t for t in all_tables}
+                
+                matched_table = None
+                if "tally_table_metadata" in all_tables_lower:
+                    meta_tbl = all_tables_lower["tally_table_metadata"]
                     with target_engine.connect() as conn:
-                        row_count = conn.execute(text(f"SELECT COUNT(*) FROM {quoted_tbl}")).scalar()
+                        try:
+                            meta_rows = conn.execute(
+                                text(f"SELECT table_name FROM {meta_tbl} WHERE UPPER(report_name) = UPPER(:rep) ORDER BY id DESC"),
+                                {"rep": rep_name}
+                            ).fetchall()
+                            for mr in meta_rows:
+                                if mr[0] and mr[0].lower() in all_tables_lower:
+                                    matched_table = all_tables_lower[mr[0].lower()]
+                                    break
+                        except Exception:
+                            pass
+                
+                if not matched_table:
+                    if table_name in all_tables_lower:
+                        matched_table = all_tables_lower[table_name]
+                    else:
+                        for t_low, t_orig in all_tables_lower.items():
+                            if t_low.startswith(table_name) and not t_low.endswith("_hash"):
+                                matched_table = t_orig
+                                break
+
+                if matched_table:
+                    is_mssql = target_engine.dialect.name == "mssql"
+                    quoted_tbl = f"[{matched_table}]" if is_mssql else f"`{matched_table}`"
+                    with target_engine.connect() as conn:
+                        row_count = None
+                        if config.company_name:
+                            try:
+                                count_q = text(f"SELECT COUNT(*) FROM {quoted_tbl} WHERE COMPANY_NAME = :comp")
+                                row_count = conn.execute(count_q, {"comp": config.company_name}).scalar()
+                            except Exception:
+                                pass
+                        if row_count is None:
+                            count_q = text(f"SELECT COUNT(*) FROM {quoted_tbl}")
+                            row_count = conn.execute(count_q).scalar()
                         total_rows = int(row_count) if row_count is not None else 0
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Error calculating rows for {config.report_name}: {e}")
                 total_rows = 0
 
         result.append({
@@ -527,17 +487,76 @@ def delete_config(identifier: Optional[str] = None, local_db: Session = Depends(
         
     if config:
         conn_name = config.connection_name or f"ID #{config.id}"
-        # Mirror delete from remote target database's sync_config table
+        # Mirror delete from remote target database and clean up data table, metadata, and logs
         try:
             target_engine = get_engine_for_config(config, local_db)
-            TargetSession = sessionmaker(autocommit=False, autoflush=False, bind=target_engine)
-            with TargetSession() as target_session:
-                remote_cfg = target_session.query(RemoteSyncConfig).filter(RemoteSyncConfig.connection_name == config.connection_name).first()
-                if remote_cfg:
-                    target_session.delete(remote_cfg)
-                    target_session.commit()
+            
+            # 1. Delete from remote sync_config
+            try:
+                TargetSession = sessionmaker(autocommit=False, autoflush=False, bind=target_engine)
+                with TargetSession() as target_session:
+                    remote_cfg = target_session.query(RemoteSyncConfig).filter(RemoteSyncConfig.connection_name == config.connection_name).first()
+                    if remote_cfg:
+                        target_session.delete(remote_cfg)
+                        target_session.commit()
+            except Exception as e:
+                logger.warning(f"Could not mirror delete to target database: {e}")
+
+            # 2. Delete logs for this connection
+            try:
+                with target_engine.connect() as conn:
+                    conn.execute(text("DELETE FROM sync_logs WHERE connection_name = :cname"), {"cname": config.connection_name})
+                    conn.commit()
+            except Exception:
+                pass
+
+            # 3. Clean up the report's generated data table and metadata from target DB
+            rep_name = (config.report_name or "").strip()
+            table_name = ''.join(c for c in rep_name.lower() if c.isalnum() or c == '_')
+            if table_name:
+                from sqlalchemy import inspect
+                inspector = inspect(target_engine)
+                all_tables = inspector.get_table_names()
+                all_tables_lower = {t.lower(): t for t in all_tables}
+                
+                matched_table = None
+                if "tally_table_metadata" in all_tables_lower:
+                    meta_tbl = all_tables_lower["tally_table_metadata"]
+                    with target_engine.connect() as conn:
+                        try:
+                            meta_row = conn.execute(
+                                text(f"SELECT table_name FROM {meta_tbl} WHERE UPPER(report_name) = UPPER(:rep)"),
+                                {"rep": rep_name}
+                            ).fetchone()
+                            if meta_row and meta_row[0] in all_tables:
+                                matched_table = meta_row[0]
+                            # Clean up metadata row
+                            conn.execute(
+                                text(f"DELETE FROM {meta_tbl} WHERE UPPER(report_name) = UPPER(:rep)"),
+                                {"rep": rep_name}
+                            )
+                            conn.commit()
+                        except Exception:
+                            pass
+                
+                if not matched_table:
+                    if table_name in all_tables_lower:
+                        matched_table = all_tables_lower[table_name]
+                    else:
+                        for t_low, t_orig in all_tables_lower.items():
+                            if t_low.startswith(table_name) and not t_low.endswith("_hash"):
+                                matched_table = t_orig
+                                break
+                
+                if matched_table:
+                    with target_engine.connect() as conn:
+                        is_mssql = target_engine.dialect.name == "mssql"
+                        quoted_tbl = f"[{matched_table}]" if is_mssql else f"`{matched_table}`"
+                        conn.execute(text(f"DROP TABLE IF EXISTS {quoted_tbl}"))
+                        conn.commit()
+                        logger.info(f"Dropped table {matched_table} upon connection deletion.")
         except Exception as e:
-            logger.warning(f"Could not mirror delete to target database: {e}")
+            logger.warning(f"Could not complete remote clean up for deleted connection: {e}")
 
         local_db.delete(config)
         local_db.commit()
@@ -723,19 +742,43 @@ def start_sync(background_tasks: BackgroundTasks, test_data: Optional[TestConfig
     return {"status": "SUCCESS", "message": "Sync started.", "log_id": log_id}
 
 @app.get("/api/sync/progress/{log_id}")
-def sync_progress(log_id: int, db: Session = Depends(get_db)):
+def sync_progress(log_id: int, local_db: Session = Depends(get_local_db)):
     """Poll for the current progress of a sync."""
-    log_entry = db.query(SyncLog).filter(SyncLog.id == log_id).first()
-    if not log_entry:
-        raise HTTPException(status_code=404, detail="Log entry not found")
-        
-    return {
-        "log_id": log_entry.id,
-        "status": log_entry.status,
-        "records_fetched": log_entry.records_fetched,
-        "message": log_entry.message,
-        "response_payload": log_entry.response_payload
-    }
+    target_cfg = local_db.query(SyncConfig).order_by(SyncConfig.id.desc()).first()
+    if target_cfg:
+        try:
+            eng = get_engine_for_config(target_cfg, local_db)
+            SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=eng)
+            with SessionLocal() as s:
+                log_entry = s.query(SyncLog).filter(SyncLog.id == log_id).first()
+                if log_entry:
+                    return {
+                        "log_id": log_entry.id,
+                        "status": log_entry.status,
+                        "records_fetched": log_entry.records_fetched,
+                        "message": log_entry.message,
+                        "response_payload": log_entry.response_payload
+                    }
+        except Exception:
+            pass
+
+    try:
+        eng = get_mysql_engine(local_db)
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=eng)
+        with SessionLocal() as s:
+            log_entry = s.query(SyncLog).filter(SyncLog.id == log_id).first()
+            if log_entry:
+                return {
+                    "log_id": log_entry.id,
+                    "status": log_entry.status,
+                    "records_fetched": log_entry.records_fetched,
+                    "message": log_entry.message,
+                    "response_payload": log_entry.response_payload
+                }
+    except Exception:
+        pass
+
+    raise HTTPException(status_code=404, detail="Log entry not found")
 
 import urllib.parse
 from sqlalchemy import create_engine as sa_create_engine
