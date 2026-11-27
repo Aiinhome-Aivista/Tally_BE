@@ -52,6 +52,13 @@ LocalBase.metadata.create_all(bind=sqlite_engine)
 _mysql_engine = None
 _mysql_db_url = None
 
+def _safe_create_engine(db_url, db_type=None, **kwargs):
+    """Wrapper around create_engine that adds use_setinputsizes=False for SQL Server
+    to fix HY104 errors with legacy ODBC drivers."""
+    if db_type and db_type.lower() == "sqlserver" or "mssql" in str(db_url):
+        kwargs.setdefault("use_setinputsizes", False)
+    return create_engine(db_url, **kwargs)
+
 def build_engine_url(db_type, host, port, username, password, database):
     db_type = (db_type or "mysql").lower()
     if db_type == "sqlserver":
@@ -67,6 +74,7 @@ def build_engine_url(db_type, host, port, username, password, database):
             "ODBC Driver 13 for SQL Server",
             "ODBC Driver 11 for SQL Server",
             "SQL Server Native Client 11.0",
+            "SQL Server",  # Legacy fallback — works with use_setinputsizes=False
         ]
         driver = None
         try:
@@ -120,7 +128,7 @@ def get_mysql_engine(local_db: Session):
     if _mysql_engine is not None:
         _mysql_engine.dispose()
         
-    _mysql_engine = create_engine(db_url, pool_pre_ping=True, pool_size=10, max_overflow=20)
+    _mysql_engine = _safe_create_engine(db_url, db_type=db_type, pool_pre_ping=True, pool_size=10, max_overflow=20)
     _mysql_db_url = db_url
     
     # Automatically create missing tables (like sync_config, sync_logs)
@@ -149,7 +157,7 @@ def ensure_database_exists(db_type, host, port, username, password, database_nam
     try:
         if db_type == "sqlserver":
             master_url = build_engine_url(db_type, host, port, username, password, "master")
-            master_engine = sa_create_engine(master_url, isolation_level="AUTOCOMMIT")
+            master_engine = _safe_create_engine(master_url, db_type=db_type, isolation_level="AUTOCOMMIT")
             with master_engine.connect() as conn:
                 conn.execute(text(f"IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = N'{database_name}') CREATE DATABASE [{database_name}]"))
             master_engine.dispose()
@@ -184,7 +192,7 @@ def get_engine_for_config(config, local_db: Session = None):
             config.db_password,
             config.database_name
         )
-        return sa_create_engine(db_url, pool_pre_ping=True)
+        return _safe_create_engine(db_url, db_type=config.db_type, pool_pre_ping=True)
     
     if local_db:
         return get_mysql_engine(local_db)
@@ -858,7 +866,7 @@ def save_mysql_config_api(config_data: MysqlConfigSchema, db: Session = Depends(
         if db_type == "sqlserver":
             # In SQL Server, connect to master to check/create database
             server_url = build_engine_url(db_type, config_data.host, config_data.port, config_data.username, config_data.password, "master")
-            server_engine = sa_create_engine(server_url, isolation_level="AUTOCOMMIT")
+            server_engine = _safe_create_engine(server_url, db_type=db_type, isolation_level="AUTOCOMMIT")
             with server_engine.connect() as conn:
                 conn.execute(text(f"IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = N'{config_data.database_name}') CREATE DATABASE [{config_data.database_name}]"))
         else:
@@ -885,13 +893,13 @@ def validate_mysql_config(config_data: MysqlConfigSchema):
         if db_type == "sqlserver":
             # Connect to master database first to create database if not exists
             server_url = build_engine_url(db_type, config_data.host, config_data.port, config_data.username, config_data.password, "master")
-            server_engine = sa_create_engine(server_url, isolation_level="AUTOCOMMIT")
+            server_engine = _safe_create_engine(server_url, db_type=db_type, isolation_level="AUTOCOMMIT")
             with server_engine.connect() as conn:
                 conn.execute(text(f"IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = N'{config_data.database_name}') CREATE DATABASE [{config_data.database_name}]"))
 
             # Now test connection to the specific database
             test_url = build_engine_url(db_type, config_data.host, config_data.port, config_data.username, config_data.password, config_data.database_name)
-            test_engine = sa_create_engine(test_url)
+            test_engine = _safe_create_engine(test_url, db_type=db_type)
             with test_engine.connect() as conn:
                 pass # successful connection
             return {"status": "SUCCESS", "message": "SQL Server Connection Successful & Database Ready"}
