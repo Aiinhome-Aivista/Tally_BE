@@ -61,20 +61,32 @@ def build_engine_url(db_type, host, port, username, password, database):
 
         is_windows_auth = (not username or username.strip() == "") and (not password)
         
+        modern_drivers = [
+            "ODBC Driver 18 for SQL Server",
+            "ODBC Driver 17 for SQL Server",
+            "ODBC Driver 13 for SQL Server",
+            "ODBC Driver 11 for SQL Server",
+            "SQL Server Native Client 11.0",
+        ]
+        driver = None
         try:
             import pyodbc
-            drivers = pyodbc.drivers()
-            driver = "ODBC Driver 17 for SQL Server" if "ODBC Driver 17 for SQL Server" in drivers else ("SQL Server" if "SQL Server" in drivers else None)
+            available_drivers = pyodbc.drivers()
+            for md in modern_drivers:
+                if md in available_drivers:
+                    driver = md
+                    break
         except Exception:
             driver = None
 
         if driver:
             if is_windows_auth:
-                conn_str = f"DRIVER={{{driver}}};SERVER={server_str};DATABASE={database};Trusted_Connection=yes;TrustServerCertificate=yes;"
+                conn_str = f"DRIVER={{{driver}}};SERVER={server_str};DATABASE={database};Trusted_Connection=yes;TrustServerCertificate=yes;Encrypt=no;"
             else:
-                conn_str = f"DRIVER={{{driver}}};SERVER={server_str};DATABASE={database};UID={username};PWD={password or ''};TrustServerCertificate=yes;"
+                conn_str = f"DRIVER={{{driver}}};SERVER={server_str};DATABASE={database};UID={username};PWD={password or ''};TrustServerCertificate=yes;Encrypt=no;"
             return f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(conn_str)}"
         else:
+            # Fallback to pure built-in pymssql (requires zero external ODBC drivers)
             encoded_password = urllib.parse.quote_plus(password or "")
             user_part = f"{username}:{encoded_password}@" if username else ""
             port_part = f":{port}" if port and "\\" not in server_str else ""
@@ -696,8 +708,8 @@ def test_sync(test_data: Optional[TestConfigSchema] = None, local_db: Session = 
 
             return {"status": "SUCCESS", "message": msg, "response_xml": response_text}
         else:
-            # Just test Tally connectivity
-            tally_service.get_ledgers()
+            # Just test Tally connectivity using active company XML
+            tally_service.test_connection()
             return {"status": "SUCCESS", "message": "Connection to Tally successful."}
     except Exception as e:
         if mysql_db:

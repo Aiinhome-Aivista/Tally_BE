@@ -193,6 +193,38 @@ class TallyService:
 
 
 
+    def test_connection(self):
+        """Test Tally connectivity by querying the active open company."""
+        xml_payload = """<ENVELOPE Action="">
+  <HEADER>
+    <VERSION>1</VERSION>
+    <TALLYREQUEST>EXPORT</TALLYREQUEST>
+    <TYPE>COLLECTION</TYPE>
+    <ID>CUSTOMCOMPANYCOL</ID>
+  </HEADER>
+  <BODY>
+    <DESC>
+      <STATICVARIABLES />
+      <TDL>
+        <TDLMESSAGE>
+          <COLLECTION ISMODIFY="No" ISFIXED="No" ISINITIALIZE="Yes" ISOPTION="No" ISINTERNAL="No" NAME="CUSTOMCOMPANYCOL">
+            <TYPE>COMPANY</TYPE>
+            <NATIVEMETHOD>NAME</NATIVEMETHOD>
+            <NATIVEMETHOD>GUID</NATIVEMETHOD>
+            <NATIVEMETHOD>BOOKSFROM</NATIVEMETHOD>
+            <NATIVEMETHOD>STARTINGFROM</NATIVEMETHOD>
+            <NATIVEMETHOD>COMPANYNUMBER</NATIVEMETHOD>
+            <NATIVEMETHOD>ENDINGAT</NATIVEMETHOD>
+            <FILTERS>ActiveCompFilt</FILTERS>
+          </COLLECTION>
+          <SYSTEM TYPE="Formulae" NAME="ActiveCompFilt">$Name = ##SVCURRENTCOMPANY</SYSTEM>
+        </TDLMESSAGE>
+      </TDL>
+    </DESC>
+  </BODY>
+</ENVELOPE>"""
+        return self._send_request(xml_payload)
+
     def get_ledgers(self):
         """Fetch all ledgers from Tally."""
         xml_payload = """<ENVELOPE>
