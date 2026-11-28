@@ -43,7 +43,7 @@ class SyncService:
             if not config:
                 # Fallback: check target database's sync_config table
                 try:
-                    from models.config import SyncConfig as RemoteSyncConfig
+                    from models import RemoteSyncConfig
                     if connection_name:
                         config = self.db.query(RemoteSyncConfig).filter(RemoteSyncConfig.connection_name == connection_name).first()
                     else:
@@ -121,9 +121,9 @@ class SyncService:
                     entity_batches[entity_name] = []
                 entity_batches[entity_name].append(item_data)
                 
-                # Update progress every 100 rows
+                # Update progress every 1000 rows
                 batch_total = sum(len(b) for b in entity_batches.values())
-                if batch_total % 100 == 0:
+                if batch_total % 1000 == 0:
                     log_entry = self.db.query(SyncLog).filter(SyncLog.id == log_id).first()
                     if log_entry:
                         log_entry.records_fetched = total_records + batch_total

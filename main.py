@@ -381,6 +381,36 @@ def get_config(local_db: Session = Depends(get_local_db)):
     return result
 
 
+@app.get("/api/sync/live-status")
+def get_live_sync_status(local_db: Session = Depends(get_local_db)):
+    """Lightweight non-blocking endpoint for AJAX polling: returns latest sync status & row count from SyncLog without heavy table COUNT(*) queries."""
+    configs = local_db.query(SyncConfig).order_by(SyncConfig.id.desc()).all()
+    statuses = {}
+    for cfg in configs:
+        cname = cfg.connection_name
+        if not cname:
+            continue
+        try:
+            engine = get_engine_for_config(cfg, local_db)
+            SessionTarget = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+            with SessionTarget() as tdb:
+                latest_log = (
+                    tdb.query(SyncLog)
+                    .filter(SyncLog.connection_name == cname)
+                    .order_by(SyncLog.id.desc())
+                    .first()
+                )
+                if latest_log:
+                    statuses[cname] = {
+                        "status": latest_log.status,
+                        "records_fetched": latest_log.records_fetched or 0,
+                        "timestamp": latest_log.timestamp.isoformat() if latest_log.timestamp else None,
+                    }
+        except Exception as e:
+            logger.debug(f"live-status check skipped for {cname}: {e}")
+    return {"statuses": statuses}
+
+
 @app.post("/api/config")
 def update_config(config_data: ConfigSchema, local_db: Session = Depends(get_local_db)):
     if not config_data.connection_name or not config_data.connection_name.strip():

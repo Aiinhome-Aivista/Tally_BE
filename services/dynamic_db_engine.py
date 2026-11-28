@@ -319,14 +319,14 @@ class DynamicDbEngine:
                         if col_type == Date or actual_db_type == Date:
                             if len(v_str) == 8 and v_str.isdigit():
                                 try:
-                                    v = datetime.datetime.strptime(v_str, "%Y%m%d").date()
+                                    v = datetime.datetime.strptime(v_str, "%Y%m%d").date().isoformat()
                                 except ValueError:
                                     v = None
                             else:
                                 parsed = False
                                 for fmt in ("%d-%b-%y", "%d-%b-%Y", "%Y-%m-%d", "%d-%m-%Y"):
                                     try:
-                                        v = datetime.datetime.strptime(v_str, fmt).date()
+                                        v = datetime.datetime.strptime(v_str, fmt).date().isoformat()
                                         parsed = True
                                         break
                                     except ValueError:
