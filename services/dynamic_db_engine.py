@@ -370,10 +370,33 @@ class DynamicDbEngine:
             
             CHUNK_SIZE = 500
 
+            inserted_count = 0
+            updated_count = 0
+            duplicates_count = 0
+            failed_count = 0
+            skipped_count = 0
+            sample_inserted = []
+            sample_updated = []
+            sample_duplicates = []
+            sample_failed = []
+
+            def _extract_id(row_dict):
+                for k, v in row_dict.items():
+                    if v and any(tok in k.upper() for tok in ("MASTERID", "ALTERID", "VOUCHERNUMBER", "GUID", "ID")):
+                        return str(v)
+                return ""
+
             if not unique_key:
                 if clean_data:
                     for i in range(0, len(clean_data), CHUNK_SIZE):
-                        conn.execute(dynamic_table.insert(), clean_data[i:i + CHUNK_SIZE])
+                        chunk = clean_data[i:i + CHUNK_SIZE]
+                        conn.execute(dynamic_table.insert(), chunk)
+                        inserted_count += len(chunk)
+                        for r in chunk:
+                            if len(sample_inserted) < 2:
+                                rid = _extract_id(r)
+                                if rid and rid not in sample_inserted:
+                                    sample_inserted.append(rid)
             else:
                 safe_unique_key = ''.join(c for c in unique_key if c.isalnum() or c == '_')
                 
@@ -414,19 +437,31 @@ class DynamicDbEngine:
                         conn.execute(del_stmt)
                     
                     # Re-add them as inserts
-                    for _, row in to_update:
+                    for val, row in to_update:
                         to_insert.append(row)
+                        if len(sample_updated) < 2 and str(val) not in sample_updated:
+                            sample_updated.append(str(val))
                 
                 # Bulk insert all rows in chunks of 500
                 if to_insert:
                     for i in range(0, len(to_insert), CHUNK_SIZE):
-                        conn.execute(dynamic_table.insert(), to_insert[i:i + CHUNK_SIZE])
+                        chunk = to_insert[i:i + CHUNK_SIZE]
+                        conn.execute(dynamic_table.insert(), chunk)
+
+                updated_count = len(to_update)
+                inserted_count = max(0, len(to_insert) - updated_count)
                     
             conn.commit()
-            logger.info(f"Successfully synced {len(clean_data)} records to {dynamic_table.name}")
-            sample_dups = [str(val) for val, _ in to_update[:2]] if unique_key and to_update else []
+            logger.info(f"Successfully synced {inserted_count} inserted, {updated_count} updated to {dynamic_table.name}")
             return {
-                "saved": len(clean_data),
-                "updated": len(to_update) if unique_key else 0,
-                "sample_duplicates": sample_dups,
+                "inserted": inserted_count,
+                "updated": updated_count,
+                "duplicates": duplicates_count,
+                "failed": failed_count,
+                "skipped_records": skipped_count,
+                "saved": inserted_count + updated_count,
+                "sample_inserted": sample_inserted,
+                "sample_updated": sample_updated,
+                "sample_duplicates": sample_duplicates,
+                "sample_failed": sample_failed,
             }

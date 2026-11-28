@@ -43,6 +43,21 @@ class TallyService:
         import xml.etree.ElementTree as ET
         import re
         self.last_blank_tags_removed = 0
+        self._debug_xml_lines = []
+        self.last_xml_stats = {
+            "total_xml_records": 0,
+            "fetched": 0,
+            "valid_records": 0,
+            "invalid_records": 0,
+            "empty_named_fields": 0,
+            "malformed_pairs_removed": 0,
+            "malformed_tokens_removed": 0,
+            "parent_record_name": "",
+            "sample_records": [],
+            "sample_invalid_records": [],
+            "malformed_examples": [],
+            "field_audit": {},
+        }
 
         def clean_xml_stream(resp):
             def valid_entity(match):
@@ -77,6 +92,12 @@ class TallyService:
                 leftover = to_process[safe_end:]
                 to_process = to_process[:safe_end]
 
+                # Keep trailing '<>' in leftover so '<></>' split across chunk boundaries is counted as a pair
+                trailing_open = re.search(r'<\s*>\s*$', to_process)
+                if trailing_open:
+                    leftover = to_process[trailing_open.start():] + leftover
+                    to_process = to_process[:trailing_open.start()]
+
                 if not to_process:
                     continue
 
@@ -84,9 +105,22 @@ class TallyService:
                 cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f]', '', to_process)
                 # Remove invalid XML numeric character references
                 cleaned = re.sub(r'&#[xX]?[0-9a-fA-F]+;', valid_entity, cleaned)
-                # Remove empty tags <> and </> that Tally produces for empty fields
-                cleaned, n_blank = re.subn(r'<\s*/?\s*>', '', cleaned)
-                self.last_blank_tags_removed += n_blank
+                # 1. Remove malformed empty tag pairs <></> (1 pair = 2 individual tokens)
+                if len(self.last_xml_stats["malformed_examples"]) < 2 and re.search(r'<\s*>\s*<\s*/\s*>', cleaned):
+                    self.last_xml_stats["malformed_examples"].append("<></>")
+                cleaned, n_pairs = re.subn(r'<\s*>\s*<\s*/\s*>', '', cleaned)
+                self.last_xml_stats["malformed_pairs_removed"] += n_pairs
+                self.last_xml_stats["malformed_tokens_removed"] += n_pairs * 2
+                # 2. Remove any remaining individual malformed <> or </> tokens
+                if len(self.last_xml_stats["malformed_examples"]) < 2:
+                    m_tok = re.search(r'<\s*/?\s*>', cleaned)
+                    if m_tok:
+                        self.last_xml_stats["malformed_examples"].append(m_tok.group(0))
+                cleaned, n_singles = re.subn(r'<\s*/?\s*>', '', cleaned)
+                self.last_xml_stats["malformed_tokens_removed"] += n_singles
+                self.last_blank_tags_removed = self.last_xml_stats["malformed_tokens_removed"]
+                if len(self._debug_xml_lines) < 200:
+                    self._debug_xml_lines.extend(cleaned.splitlines())
 
                 yield cleaned.encode('utf-8')
 
@@ -94,7 +128,12 @@ class TallyService:
             if leftover:
                 cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f]', '', leftover)
                 cleaned = re.sub(r'&#[xX]?[0-9a-fA-F]+;', valid_entity, cleaned)
-                cleaned = re.sub(r'<\s*/?\s*>', '', cleaned)
+                cleaned, n_pairs = re.subn(r'<\s*>\s*<\s*/\s*>', '', cleaned)
+                self.last_xml_stats["malformed_pairs_removed"] += n_pairs
+                self.last_xml_stats["malformed_tokens_removed"] += n_pairs * 2
+                cleaned, n_singles = re.subn(r'<\s*/?\s*>', '', cleaned)
+                self.last_xml_stats["malformed_tokens_removed"] += n_singles
+                self.last_blank_tags_removed = self.last_xml_stats["malformed_tokens_removed"]
                 if cleaned.strip():
                     yield cleaned.encode('utf-8')
 
@@ -139,6 +178,56 @@ class TallyService:
         current_base_entity = None
         skip_tags = {'HEADER', 'DESC', 'STATICVARIABLES', 'IMPORTDATA', 'EXPORTDATA', 'BODY'}
 
+        def _record_audit(rec, entity_name):
+            stats = self.last_xml_stats
+            stats["total_xml_records"] += 1
+            stats["fetched"] += 1
+            stats["valid_records"] += 1
+            if not stats["parent_record_name"] and entity_name:
+                stats["parent_record_name"] = entity_name
+            # Find an identifier for this record dynamically
+            rec_id = ""
+            for k, v in rec.items():
+                if v and any(tok in k.upper() for tok in ("MASTERID", "ALTERID", "VOUCHERNUMBER", "GUID", "ID")):
+                    rec_id = str(v)
+                    break
+            if len(stats["sample_records"]) < 2:
+                # Store compact preview (first 8 fields)
+                preview = {k: rec[k] for k in list(rec.keys())[:8]}
+                stats["sample_records"].append({"id": rec_id or "N/A", "entity": entity_name, "fields": preview})
+            fa = stats["field_audit"]
+            for k, v in rec.items():
+                is_empty = (v == "" or v is None)
+                if is_empty:
+                    stats["empty_named_fields"] += 1
+                entry = fa.get(k)
+                if entry is None:
+                    entry = {
+                        "empty": 0,
+                        "filled": 0,
+                        "total": 0,
+                        "empty_example": "",
+                        "filled_example": "",
+                        "sample_value": "",
+                        "record_id": "",
+                    }
+                    fa[k] = entry
+                entry["total"] += 1
+                if is_empty:
+                    entry["empty"] += 1
+                    if not entry["empty_example"]:
+                        entry["empty_example"] = f"<{k}></{k}>"
+                        if not entry["record_id"] and rec_id:
+                            entry["record_id"] = rec_id
+                else:
+                    entry["filled"] += 1
+                    if not entry["filled_example"]:
+                        val_str = str(v)[:80]
+                        entry["filled_example"] = f"<{k}>{val_str}</{k}>"
+                        entry["sample_value"] = val_str
+                        if rec_id:
+                            entry["record_id"] = rec_id
+
         try:
             context = ET.iterparse(stream, events=("start", "end"))
             for event, elem in context:
@@ -178,6 +267,7 @@ class TallyService:
                                         break
 
                             if should_flush and current_record:
+                                _record_audit(current_record, current_base_entity)
                                 yield current_record, current_base_entity
                                 current_record = {}
 
@@ -187,11 +277,21 @@ class TallyService:
                         elem.clear()
 
             if current_record and current_base_entity:
+                _record_audit(current_record, current_base_entity)
                 yield current_record, current_base_entity
 
         except ET.ParseError as e:
-            logger.error(f"XML ParseError: {e}")
-            raise Exception(f"Failed to parse XML from Tally: {e}")
+            err_detail = str(e)
+            try:
+                line_no = e.position[0] if hasattr(e, "position") and e.position else None
+                if line_no and 1 <= line_no <= len(self._debug_xml_lines):
+                    bad_line = self._debug_xml_lines[line_no - 1].strip()
+                    if bad_line:
+                        err_detail = f"{e} | Line {line_no}: {bad_line[:120]}"
+            except Exception:
+                pass
+            logger.error(f"XML ParseError: {err_detail}")
+            raise Exception(f"Failed to parse XML from Tally: {err_detail}")
 
 
 

@@ -109,10 +109,19 @@ class SyncService:
             # Key: entity_name → list of records for that entity
             entity_batches: dict = {}
             total_records = 0
-            total_saved = 0
+            total_inserted = 0
             total_updated = 0
+            total_duplicates = 0
+            total_failed = 0
+            total_skipped = 0
+            sample_inserted = []
+            sample_updated = []
             sample_duplicates = []
+            sample_failed = []
+            prev_alter_id = last_alter_id
             max_alter_id = last_alter_id
+            import datetime as _dt
+            sync_start_time = _dt.datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
             preview_data = None
             first_entity = None
             
@@ -159,13 +168,25 @@ class SyncService:
                     
                     sync_res = self.db_engine.sync_data(report_name, entity_name, batch, unique_key_field=unique_key, company_name=config.company_name)
                     if isinstance(sync_res, dict):
-                        total_saved += sync_res.get("saved", len(batch))
+                        total_inserted += sync_res.get("inserted", 0)
                         total_updated += sync_res.get("updated", 0)
+                        total_duplicates += sync_res.get("duplicates", 0)
+                        total_failed += sync_res.get("failed", 0)
+                        total_skipped += sync_res.get("skipped_records", 0)
+                        for s in sync_res.get("sample_inserted", []):
+                            if len(sample_inserted) < 2 and s not in sample_inserted:
+                                sample_inserted.append(s)
+                        for s in sync_res.get("sample_updated", []):
+                            if len(sample_updated) < 3 and s not in sample_updated:
+                                sample_updated.append(s)
                         for s in sync_res.get("sample_duplicates", []):
-                            if len(sample_duplicates) < 2 and s not in sample_duplicates:
+                            if len(sample_duplicates) < 3 and s not in sample_duplicates:
                                 sample_duplicates.append(s)
+                        for s in sync_res.get("sample_failed", []):
+                            if len(sample_failed) < 3 and s not in sample_failed:
+                                sample_failed.append(s)
                     else:
-                        total_saved += len(batch)
+                        total_inserted += len(batch)
                     total_records += len(batch)
                     logger.info(f"[{entity_name}] Inserted batch of {len(batch)} records. Total: {total_records}")
                     entity_batches[entity_name] = []
@@ -186,13 +207,25 @@ class SyncService:
                     preview_data = "\n".join(xml_parts)
                 sync_res = self.db_engine.sync_data(report_name, ename, batch, unique_key_field=unique_key, company_name=config.company_name)
                 if isinstance(sync_res, dict):
-                    total_saved += sync_res.get("saved", len(batch))
+                    total_inserted += sync_res.get("inserted", 0)
                     total_updated += sync_res.get("updated", 0)
+                    total_duplicates += sync_res.get("duplicates", 0)
+                    total_failed += sync_res.get("failed", 0)
+                    total_skipped += sync_res.get("skipped_records", 0)
+                    for s in sync_res.get("sample_inserted", []):
+                        if len(sample_inserted) < 2 and s not in sample_inserted:
+                            sample_inserted.append(s)
+                    for s in sync_res.get("sample_updated", []):
+                        if len(sample_updated) < 3 and s not in sample_updated:
+                            sample_updated.append(s)
                     for s in sync_res.get("sample_duplicates", []):
-                        if len(sample_duplicates) < 2 and s not in sample_duplicates:
+                        if len(sample_duplicates) < 3 and s not in sample_duplicates:
                             sample_duplicates.append(s)
+                    for s in sync_res.get("sample_failed", []):
+                        if len(sample_failed) < 3 and s not in sample_failed:
+                            sample_failed.append(s)
                 else:
-                    total_saved += len(batch)
+                    total_inserted += len(batch)
                 total_records += len(batch)
                 logger.info(f"[{ename}] Final batch of {len(batch)} records. Total: {total_records}")
                 
@@ -214,14 +247,67 @@ class SyncService:
             log_entry = self.db.query(SyncLog).filter(SyncLog.id == log_id).first()
             if log_entry:
                 from sqlalchemy.sql import func
+                xml_stats = getattr(self.tally_service, "last_xml_stats", {}) or {}
+                total_xml = xml_stats.get("total_xml_records", total_records)
+                fetched_xml = xml_stats.get("fetched", total_records)
+                valid_xml = xml_stats.get("valid_records", total_records)
+                invalid_xml = xml_stats.get("invalid_records", 0)
+                empty_fields = xml_stats.get("empty_named_fields", 0)
+                malformed_pairs = xml_stats.get("malformed_pairs_removed", 0)
+                malformed_tokens = xml_stats.get("malformed_tokens_removed", getattr(self.tally_service, "last_blank_tags_removed", 0))
+
+                upd_str = f" (e.g. {', '.join(sample_updated)})" if total_updated > 0 and sample_updated else ""
+                dup_str = f" (e.g. {', '.join(sample_duplicates)})" if total_duplicates > 0 and sample_duplicates else ""
+                fail_str = f" (e.g. {', '.join(sample_failed)})" if total_failed > 0 and sample_failed else ""
+
                 log_entry.status = "SUCCESS"
-                blank_tags = getattr(self.tally_service, "last_blank_tags_removed", 0)
-                dup_sample_str = f" (e.g. {', '.join(sample_duplicates)})" if total_updated > 0 and sample_duplicates else ""
-                log_entry.message = (
-                    f"Sync completed successfully. Fetched: {total_records:,} | Saved: {total_saved:,} | Updated/Duplicates: {total_updated:,}{dup_sample_str} | Blank Tags Skipped: {blank_tags:,}"
-                    if total_records > 0
-                    else "Sync completed successfully. No new changes."
-                )
+                if total_records > 0:
+                    import json as _json
+                    import datetime as _dt
+                    sync_end_time = _dt.datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
+                    audit_payload = {
+                        "audit_version": 2,
+                        "xml": {
+                            "total_xml_records": total_xml,
+                            "fetched": fetched_xml,
+                            "valid_records": valid_xml,
+                            "invalid_records": invalid_xml,
+                            "empty_named_fields": empty_fields,
+                            "malformed_pairs_removed": malformed_pairs,
+                            "malformed_tokens_removed": malformed_tokens,
+                            "parent_record_name": xml_stats.get("parent_record_name", ""),
+                            "sample_records": xml_stats.get("sample_records", []),
+                            "sample_invalid_records": xml_stats.get("sample_invalid_records", []),
+                            "malformed_examples": xml_stats.get("malformed_examples", []),
+                            "field_audit": xml_stats.get("field_audit", {}),
+                        },
+                        "db": {
+                            "inserted": total_inserted,
+                            "updated": total_updated,
+                            "duplicates": total_duplicates,
+                            "failed": total_failed,
+                            "skipped_records": total_skipped,
+                            "sample_inserted": sample_inserted,
+                            "sample_updated": sample_updated,
+                            "sample_duplicates": sample_duplicates,
+                            "sample_failed": sample_failed,
+                        },
+                        "sync": {
+                            "company": config.company_name or "N/A",
+                            "report": report_name,
+                            "start_time": sync_start_time,
+                            "completion_time": sync_end_time,
+                            "previous_alter_id": prev_alter_id,
+                            "current_alter_id": max_alter_id,
+                            "status": "SUCCESS",
+                        },
+                    }
+                    log_entry.message = _json.dumps(audit_payload)
+                else:
+                    log_entry.message = (
+                        f"Sync completed successfully. No new changes.\n"
+                        f"Company: {config.company_name or 'N/A'} | Report: {report_name} | LAST_ALTER_ID: {prev_alter_id}"
+                    )
                 log_entry.records_fetched = total_records
                 log_entry.timestamp = func.now()
                 if preview_data:
