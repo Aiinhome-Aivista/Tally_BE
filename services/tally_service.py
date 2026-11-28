@@ -42,6 +42,7 @@ class TallyService:
         """
         import xml.etree.ElementTree as ET
         import re
+        self.last_blank_tags_removed = 0
 
         def clean_xml_stream(resp):
             def valid_entity(match):
@@ -84,7 +85,8 @@ class TallyService:
                 # Remove invalid XML numeric character references
                 cleaned = re.sub(r'&#[xX]?[0-9a-fA-F]+;', valid_entity, cleaned)
                 # Remove empty tags <> and </> that Tally produces for empty fields
-                cleaned = re.sub(r'<\s*/?\s*>', '', cleaned)
+                cleaned, n_blank = re.subn(r'<\s*/?\s*>', '', cleaned)
+                self.last_blank_tags_removed += n_blank
 
                 yield cleaned.encode('utf-8')
 

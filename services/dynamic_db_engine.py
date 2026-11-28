@@ -424,3 +424,9 @@ class DynamicDbEngine:
                     
             conn.commit()
             logger.info(f"Successfully synced {len(clean_data)} records to {dynamic_table.name}")
+            sample_dups = [str(val) for val, _ in to_update[:2]] if unique_key and to_update else []
+            return {
+                "saved": len(clean_data),
+                "updated": len(to_update) if unique_key else 0,
+                "sample_duplicates": sample_dups,
+            }

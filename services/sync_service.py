@@ -109,6 +109,9 @@ class SyncService:
             # Key: entity_name → list of records for that entity
             entity_batches: dict = {}
             total_records = 0
+            total_saved = 0
+            total_updated = 0
+            sample_duplicates = []
             max_alter_id = last_alter_id
             preview_data = None
             first_entity = None
@@ -154,7 +157,15 @@ class SyncService:
                         xml_parts.append("</PREVIEW>")
                         preview_data = "\n".join(xml_parts)
                     
-                    self.db_engine.sync_data(report_name, entity_name, batch, unique_key_field=unique_key, company_name=config.company_name)
+                    sync_res = self.db_engine.sync_data(report_name, entity_name, batch, unique_key_field=unique_key, company_name=config.company_name)
+                    if isinstance(sync_res, dict):
+                        total_saved += sync_res.get("saved", len(batch))
+                        total_updated += sync_res.get("updated", 0)
+                        for s in sync_res.get("sample_duplicates", []):
+                            if len(sample_duplicates) < 2 and s not in sample_duplicates:
+                                sample_duplicates.append(s)
+                    else:
+                        total_saved += len(batch)
                     total_records += len(batch)
                     logger.info(f"[{entity_name}] Inserted batch of {len(batch)} records. Total: {total_records}")
                     entity_batches[entity_name] = []
@@ -173,7 +184,15 @@ class SyncService:
                         xml_parts.append("  </RECORD>")
                     xml_parts.append("</PREVIEW>")
                     preview_data = "\n".join(xml_parts)
-                self.db_engine.sync_data(report_name, ename, batch, unique_key_field=unique_key, company_name=config.company_name)
+                sync_res = self.db_engine.sync_data(report_name, ename, batch, unique_key_field=unique_key, company_name=config.company_name)
+                if isinstance(sync_res, dict):
+                    total_saved += sync_res.get("saved", len(batch))
+                    total_updated += sync_res.get("updated", 0)
+                    for s in sync_res.get("sample_duplicates", []):
+                        if len(sample_duplicates) < 2 and s not in sample_duplicates:
+                            sample_duplicates.append(s)
+                else:
+                    total_saved += len(batch)
                 total_records += len(batch)
                 logger.info(f"[{ename}] Final batch of {len(batch)} records. Total: {total_records}")
                 
@@ -196,7 +215,13 @@ class SyncService:
             if log_entry:
                 from sqlalchemy.sql import func
                 log_entry.status = "SUCCESS"
-                log_entry.message = "Sync completed successfully." if total_records > 0 else "Sync completed successfully. No new changes."
+                blank_tags = getattr(self.tally_service, "last_blank_tags_removed", 0)
+                dup_sample_str = f" (e.g. {', '.join(sample_duplicates)})" if total_updated > 0 and sample_duplicates else ""
+                log_entry.message = (
+                    f"Sync completed successfully. Fetched: {total_records:,} | Saved: {total_saved:,} | Updated/Duplicates: {total_updated:,}{dup_sample_str} | Blank Tags Skipped: {blank_tags:,}"
+                    if total_records > 0
+                    else "Sync completed successfully. No new changes."
+                )
                 log_entry.records_fetched = total_records
                 log_entry.timestamp = func.now()
                 if preview_data:
